@@ -65,36 +65,36 @@ endpoint=%s`, hex.EncodeToString(privKey[:]), hex.EncodeToString(pubKey[:]), end
 	}, nil
 }
 
-func (wg *wireguardProxy) ProxyConn(network, addr string, subprocess net.Conn) {
-	conn, err := wg.tnet.Dial(network, addr)
+func (wg *wireguardProxy) ProxyConn(ctx context.Context, network string, addr netip.AddrPort, subprocess net.Conn) {
+	var conn net.Conn
+	var err error
+	switch network {
+	case "tcp":
+		conn, err = wg.tnet.DialContextTCPAddrPort(ctx, addr)
+	case "udp":
+		conn, err = wg.tnet.DialUDPAddrPort(netip.AddrPort{}, addr)
+	default:
+		panic(network)
+	}
 	if err != nil {
+		slog.Debug("error dialing", "addr", addr, "err", err)
 		// TODO: report errors not related to destination being unreachable
-		subprocess.Close()
+		if err := subprocess.Close(); err != nil {
+			slog.Debug("error proxying conn", "network", network, "to", addr, "err", err)
+		}
 		return
 	}
+	slog.Debug("proxy start", "addr", addr)
 	go proxyBytes(subprocess, conn)
 	go proxyBytes(conn, subprocess)
 }
 
 // proxyBytes copies data between the world and the subprocess
 func proxyBytes(w io.Writer, r io.Reader) {
-	buf := make([]byte, 1<<20)
-	for {
-		n, err := r.Read(buf)
-		if err == io.EOF {
-			// how to indicate to outside world that we're done?
-			return
-		}
-		if err != nil {
-			// how to indicate to outside world that the read failed?
-			slog.Error(fmt.Sprintf("error reading in proxyBytes: %v, abandoning", err))
-			return
-		}
-
-		// send packet to channel, drop on failure
-		_, err = w.Write(buf[:n])
-		if err != nil {
-			slog.Error(fmt.Sprintf("error writing in proxyBytes: %v, dropping %d bytes", err, n))
-		}
+	n, err := io.Copy(w, r)
+	if err != nil {
+		slog.Error("error copying bytes", "err", err, "n", n)
+	} else {
+		slog.Debug("copied bytes", "n", n)
 	}
 }

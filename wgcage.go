@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/user"
@@ -18,6 +19,7 @@ import (
 	"github.com/euank/wirecage/pkg/overlay"
 	"github.com/songgao/water"
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -267,26 +269,26 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("error parsing global subnet: %w", err)
 	}
-
-	// parse the subnet corresponding to all globally routable ipv6 addresses
-	ip6Routable, err := netlink.ParseIPNet("2000::/3")
-	if err != nil {
-		return fmt.Errorf("error parsing global subnet: %w", err)
-	}
-
 	// add a route that sends all ipv4 traffic going anywhere to the tun device
 	err = netlink.RouteAdd(&netlink.Route{
 		Dst:       ip4Routable,
 		LinkIndex: link.Attrs().Index,
+		Family:    nl.FAMILY_V4,
 	})
 	if err != nil {
 		return fmt.Errorf("error creating default ipv4 route: %w", err)
 	}
 
+	// parse the subnet corresponding to all globally routable ipv6 addresses
+	ip6Routable, err := netlink.ParseIPNet("::/0")
+	if err != nil {
+		return fmt.Errorf("error parsing global subnet: %w", err)
+	}
 	// add a route that sends all ipv6 traffic going anywhere to the tun device
 	err = netlink.RouteAdd(&netlink.Route{
 		Dst:       ip6Routable,
 		LinkIndex: link.Attrs().Index,
+		Family:    nl.FAMILY_V6,
 	})
 	if err != nil {
 		slog.Debug(fmt.Sprintf("error creating default ipv6 route: %v, ignoring", err))
@@ -303,46 +305,6 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("error bringing up link for loopback device: %w", err)
 	}
-
-	// if --dump was provided then start watching everything
-	// if args.DumpTCP {
-	//	iface, err := net.InterfaceByName(args.Tun)
-	//	if err != nil {
-	//		return err
-	//	}
-
-	//	// packet.Raw means listen for raw IP packets (requires root permissions)
-	//	// unix.ETH_P_ALL means listen for all packets
-	//	conn, err := packet.Listen(iface, packet.Raw, unix.ETH_P_ALL, nil)
-	//	if err != nil {
-	//		if errors.Is(err, unix.EPERM) {
-	//			return fmt.Errorf("you need root permissions to read raw packets (%w)", err)
-	//		}
-	//		return fmt.Errorf("error listening for raw packet: %w", err)
-	//	}
-
-	//	// set promiscuous mode so that we see everything
-	//	err = conn.SetPromiscuous(true)
-	//	if err != nil {
-	//		return fmt.Errorf("error setting raw packet connection to promiscuous mode: %w", err)
-	//	}
-
-	//	go func() {
-	//		// read packets forever
-	//		buf := make([]byte, iface.MTU)
-	//		for {
-	//			n, _, err := conn.ReadFrom(buf)
-	//			if err != nil {
-	//				log.Printf("error reading raw packet: %v, aborting dump", err)
-	//				return
-	//			}
-
-	//			// decode and dump
-	//			packet := gopacket.NewPacket(buf[:n], layers.LayerTypeIPv4, gopacket.NoCopy)
-	//			log.Println(packet.Dump())
-	//		}
-	//	}()
-	//}
 
 	// if /etc/ is a directory then set up an overlay
 	if st, err := os.Lstat("/etc"); err == nil && st.IsDir() && !args.NoOverlay {
@@ -362,12 +324,6 @@ func run(ctx context.Context) error {
 		"PS1=wirecage # ",
 		"wirecage=1",
 	)
-
-	slog.Debug("running subcommand now ================")
-
-	// start sending packets to the process
-	toSubprocess := make(chan []byte, 1000)
-	go copyToDevice(ctx, tun, toSubprocess)
 
 	slog.Debug(fmt.Sprintf("listening on %v", args.Tun))
 
@@ -395,17 +351,20 @@ func run(ctx context.Context) error {
 			"from", fmt.Sprintf("%v:%v", r.ID().RemoteAddress.String(), r.ID().RemotePort),
 			"to", fmt.Sprintf("%v:%v", r.ID().LocalAddress.String(), r.ID().LocalPort),
 		)
-		go func() {
-			req := &tcpRequest{r, new(waiter.Queue)}
-			conn, err := req.Accept()
-			if err != nil {
-				slog.Error("error accepting tcp", "err", err)
-				r.Complete(true)
-				return
-			}
-			dst := conn.LocalAddr().String()
-			proxy.ProxyConn("tcp", dst, conn)
-		}()
+		req := &tcpRequest{r, new(waiter.Queue)}
+		conn, err := req.Accept()
+		if err != nil {
+			slog.Error("error accepting tcp", "err", err)
+			r.Complete(true)
+			return
+		}
+		addrPort, err := netip.ParseAddrPort(conn.LocalAddr().String())
+		if err != nil {
+			slog.Error("invalid localaddr", "err", err, "laddr", conn.LocalAddr())
+			r.Complete(true)
+			return
+		}
+		proxy.ProxyConn(ctx, "tcp", addrPort, conn)
 	})
 
 	// TODO: this UDP forwarder sometimes only ever processes one UDP packet, other times it keeps going... :/
@@ -418,18 +377,18 @@ func run(ctx context.Context) error {
 
 		// create an endpoint for responding to this packet -- unlike TCP we do this right away because there is no SYN+ACK to decide whether to send
 		var wq waiter.Queue
-		ep, err := r.CreateEndpoint(&wq)
-		if err != nil {
-			slog.Error("error creating udp endpoint", "err", err)
+		ep, epErr := r.CreateEndpoint(&wq)
+		if epErr != nil {
+			slog.Error("error creating udp endpoint", "err", epErr)
 			return
 		}
-
-		// dispatch the request via the mux
-		go func() {
-			conn := gonet.NewUDPConn(&wq, ep)
-			dst := conn.LocalAddr().String()
-			proxy.ProxyConn("udp", dst, conn)
-		}()
+		conn := gonet.NewUDPConn(&wq, ep)
+		addrPort, err := netip.ParseAddrPort(conn.LocalAddr().String())
+		if err != nil {
+			slog.Error("invalid localaddr", "err", err, "laddr", conn.LocalAddr())
+			return
+		}
+		proxy.ProxyConn(ctx, "udp", addrPort, conn)
 	})
 
 	// register the forwarders with the stack

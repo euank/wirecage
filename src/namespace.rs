@@ -104,6 +104,15 @@ fn setup_network_config(args: &Args) -> Result<()> {
             .execute()
             .await
             .context("failed to add address to TUN device")?;
+        
+        // Also add a link-local IPv6 address for IPv6 connectivity
+        let ipv6_addr = std::net::Ipv6Addr::new(0xfd42, 0x42, 0x42, 0, 0, 0, 0, 2);
+        debug!("Adding IPv6 address: {}/64", ipv6_addr);
+        let _ = handle
+            .address()
+            .add(link_index, std::net::IpAddr::V6(ipv6_addr), 64)
+            .execute()
+            .await;
 
         // Add default IPv4 route
         handle

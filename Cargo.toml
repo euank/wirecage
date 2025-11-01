@@ -1,0 +1,35 @@
+[package]
+name = "wirecage"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wirecage"
+path = "src/main.rs"
+
+[[bin]]
+name = "wirecagesrv"
+path = "src/server.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1.42", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nix = { version = "0.29", features = ["user", "mount", "sched", "process", "net"] }
+libc = "0.2"
+base64 = "0.22"
+boringtun = "0.6"
+tun = { version = "0.6", features = ["async"] }
+rtnetlink = "0.14"
+netlink-packet-route = "0.20"
+futures = "0.3"
+bytes = "1.9"
+ipnet = "2.10"
+tempfile = "3.13"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

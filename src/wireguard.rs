@@ -14,11 +14,12 @@ pub struct WireGuardTunnel {
 }
 
 impl WireGuardTunnel {
-    pub async fn new(
+    pub async fn new_from_fd(
         private_key: &str,
         public_key: &str,
         endpoint: &str,
         _local_ip: &str,
+        socket_fd: std::os::unix::io::RawFd,
     ) -> Result<Self> {
         // Decode keys
         let private_key_bytes = base64::engine::general_purpose::STANDARD
@@ -58,11 +59,16 @@ impl WireGuardTunnel {
         )
         .map_err(|e| anyhow::anyhow!("failed to create WireGuard tunnel: {}", e))?;
 
-        // Bind UDP socket
-        let socket = UdpSocket::bind("0.0.0.0:0").await
-            .context("failed to bind UDP socket")?;
-
-        debug!("WireGuard tunnel created, endpoint: {}", endpoint);
+        // Convert the raw FD to a tokio UDP socket
+        let socket = unsafe {
+            use std::os::unix::io::FromRawFd;
+            let std_socket = std::net::UdpSocket::from_raw_fd(socket_fd);
+            std_socket.set_nonblocking(true)?;
+            UdpSocket::from_std(std_socket)?
+        };
+        
+        let local_addr = socket.local_addr()?;
+        debug!("WireGuard tunnel created, local: {}, endpoint: {}", local_addr, endpoint);
 
         Ok(Self {
             tunnel: Arc::new(Mutex::new(Box::new(tunnel))),

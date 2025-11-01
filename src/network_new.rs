@@ -68,14 +68,16 @@ pub async fn run_wireguard_host(
     });
 
     // Task: Forward packets from WireGuard socket to TUN (via channel)
-    tokio::spawn(async move {
+    let recv_handle = tokio::spawn(async move {
         let local_addr = wg_socket_rx.local_addr().unwrap();
         debug!("WG->TUN forwarder started (host namespace), listening on {}", local_addr);
         let mut recv_buf = vec![0u8; 2048];
         let mut decap_buf = vec![0u8; 2048];
+        let mut counter = 0u32;
 
         loop {
-            debug!("WG->TUN: calling recv_from...");
+            counter += 1;
+            debug!("WG->TUN: calling recv_from (attempt {})...", counter);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 wg_socket_rx.recv_from(&mut recv_buf)
@@ -137,8 +139,16 @@ pub async fn run_wireguard_host(
         }
     });
 
-    // Keep running until the timer task completes (which is never)
-    timer_handle.await?;
+    // Keep all tasks running
+    debug!("WireGuard: waiting for tasks to complete");
+    tokio::select! {
+        result = recv_handle => {
+            error!("WG->TUN recv task ended: {:?}", result);
+        }
+        result = timer_handle => {
+            error!("Timer task ended: {:?}", result);
+        }
+    }
     Ok(())
 }
 

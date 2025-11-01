@@ -45,23 +45,39 @@ pub async fn run_wireguard_host(
         while let Some(packet) = tun_to_wg_rx.recv().await {
             debug!("TUN->WG: received {} bytes from channel", packet.len());
 
-            let mut tunnel = wg_tunnel_tx.lock().await;
-            let mut out_buf = vec![0u8; packet.len() + 148];
+            // Retry encapsulation if handshake is in progress
+            let mut retries = 0;
+            loop {
+                let mut tunnel = wg_tunnel_tx.lock().await;
+                let mut out_buf = vec![0u8; packet.len() + 148];
 
-            match tunnel.encapsulate(&packet, &mut out_buf) {
-                boringtun::noise::TunnResult::WriteToNetwork(data) => {
-                    debug!("TUN->WG: sending {} bytes to WireGuard", data.len());
-                    if let Err(e) = wg_socket_tx.send_to(data, wg_endpoint).await {
-                        error!("TUN->WG: send error: {}", e);
+                match tunnel.encapsulate(&packet, &mut out_buf) {
+                    boringtun::noise::TunnResult::WriteToNetwork(data) => {
+                        debug!("TUN->WG: sending {} bytes to WireGuard", data.len());
+                        if let Err(e) = wg_socket_tx.send_to(data, wg_endpoint).await {
+                            error!("TUN->WG: send error: {}", e);
+                        }
+                        break; // Success, move to next packet
+                    }
+                    boringtun::noise::TunnResult::Done => {
+                        debug!("TUN->WG: handshake in progress (retry {})", retries);
+                        retries += 1;
+                        if retries > 20 {
+                            error!("TUN->WG: gave up waiting for handshake");
+                            break;
+                        }
+                        drop(tunnel); // Release lock before sleeping
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        // Retry
+                    }
+                    boringtun::noise::TunnResult::Err(e) => {
+                        error!("TUN->WG: encapsulation error: {:?}", e);
+                        break;
+                    }
+                    _ => {
+                        break;
                     }
                 }
-                boringtun::noise::TunnResult::Done => {
-                    debug!("TUN->WG: handshake in progress");
-                }
-                boringtun::noise::TunnResult::Err(e) => {
-                    error!("TUN->WG: encapsulation error: {:?}", e);
-                }
-                _ => {}
             }
         }
         debug!("TUN->WG forwarder ended");

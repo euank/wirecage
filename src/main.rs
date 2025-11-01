@@ -172,8 +172,13 @@ fn stage_two(args: Args) -> Result<()> {
     // Start TUN/network stack in CHILD namespace
     debug!("starting TUN child in network namespace");
     let args_tun = args.clone();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _tun_handle = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        
         runtime.block_on(async move {
             if let Err(e) = network_new::run_tun_child(&args_tun, tun_to_wg_tx, wg_to_tun_rx, tun_device).await {
                 tracing::error!("TUN child error: {}", e);

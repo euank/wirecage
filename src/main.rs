@@ -199,14 +199,19 @@ fn stage_two(args: Args) -> Result<()> {
     env.push(("PS1".to_string(), "wirecage # ".to_string()));
     env.push(("wirecage".to_string(), "1".to_string()));
 
-    debug!("execing command: {:?}", command);
+    debug!("spawning command: {:?}", command);
 
-    // Exec the target command (replaces this process)
-    let err = Command::new(&command[0])
+    // Spawn the target command (don't exec - we need to keep WireGuard thread alive!)
+    let mut child = Command::new(&command[0])
         .args(&command[1..])
         .env_clear()
         .envs(env)
-        .exec();
+        .spawn()
+        .context("failed to spawn command")?;
 
-    Err(anyhow::anyhow!("exec failed: {}", err))
+    // Wait for child to complete
+    let status = child.wait().context("failed to wait for child")?;
+
+    // Exit with the same code as the child
+    std::process::exit(status.code().unwrap_or(1))
 }

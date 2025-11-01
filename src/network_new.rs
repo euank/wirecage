@@ -109,12 +109,16 @@ pub async fn run_wireguard_host(
                             if let Err(e) = wg_to_tun_tx.send(data.to_vec()).await {
                                 error!("WG->TUN: channel send error: {}", e);
                                 break;
+                            } else {
+                                debug!("WG->TUN: sent to channel successfully");
                             }
                         }
                         boringtun::noise::TunnResult::Err(e) => {
                             error!("WG->TUN: decapsulation error: {:?}", e);
                         }
-                        _ => {}
+                        result => {
+                            debug!("WG->TUN: decapsulation result: {:?}", result);
+                        }
                     }
                 }
                 Ok(Err(e)) => {

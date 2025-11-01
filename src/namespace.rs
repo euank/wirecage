@@ -86,12 +86,18 @@ fn setup_network_config(args: &Args) -> Result<()> {
             .await
             .context("failed to bring up TUN device")?;
 
-        // Parse and add the subnet address
-        let subnet: ipnet::IpNet = args.subnet.parse()
-            .context("invalid subnet")?;
+        // Use the WireGuard address as the TUN IP (not the subnet arg)
+        // The server's allowed_ips must match this
+        let wg_addr: std::net::IpAddr = args.wg_address.parse()
+            .context("invalid wg-address")?;
         
-        let addr = subnet.addr();
-        let prefix_len = subnet.prefix_len();
+        let addr = wg_addr;
+        let prefix_len = match addr {
+            std::net::IpAddr::V4(_) => 24,
+            std::net::IpAddr::V6(_) => 64,
+        };
+        
+        debug!("Setting TUN IP to WireGuard address: {}/{}", addr, prefix_len);
 
         handle
             .address()

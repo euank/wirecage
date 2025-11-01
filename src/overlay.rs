@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use std::path::{Path, PathBuf};
 use tracing::debug;

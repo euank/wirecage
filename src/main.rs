@@ -1,6 +1,5 @@
 mod args;
 mod namespace;
-mod network;
 mod network_new;
 mod overlay;
 mod wireguard;
@@ -135,7 +134,7 @@ fn stage_two(args: Args) -> Result<()> {
     debug!("starting WireGuard in host namespace");
     let args_wg = args.clone();
     let private_key_wg = private_key.clone();
-    let wg_handle = std::thread::spawn(move || {
+    let _wg_handle = std::thread::spawn(move || {
         // This thread is in the host network namespace and will stay there
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

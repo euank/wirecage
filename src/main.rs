@@ -137,7 +137,8 @@ fn stage_two(args: Args) -> Result<()> {
     let private_key_wg = private_key.clone();
     let wg_handle = std::thread::spawn(move || {
         // This thread is in the host network namespace and will stay there
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .unwrap();

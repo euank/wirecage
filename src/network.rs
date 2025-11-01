@@ -10,29 +10,45 @@ use tracing::{debug, error};
 use crate::args::Args;
 use crate::wireguard::WireGuardTunnel;
 
-pub async fn run_network_stack(args: &Args, private_key: &str) -> Result<()> {
-    // Create WireGuard tunnel
-    let wg_tunnel = WireGuardTunnel::new(
+pub async fn run_network_stack(
+    args: &Args, 
+    private_key: &str,
+    wg_socket_fd: std::os::unix::io::RawFd,
+    tun_device: std::sync::Arc<std::sync::Mutex<tun::platform::Device>>
+) -> Result<()> {
+    debug!("network stack starting with pre-created UDP socket");
+    
+    // Create WireGuard tunnel using the pre-created socket from host namespace
+    let wg_tunnel = WireGuardTunnel::new_from_fd(
         private_key,
         &args.wg_public_key,
         &args.wg_endpoint,
         &args.wg_address,
+        wg_socket_fd,
     )
     .await?;
 
-    // Open TUN device for reading packets from subprocess
-    // Note: Device was already created and configured in namespace setup
-    let mut config = tun::Configuration::default();
-    config.name(&args.tun);
-
-    #[cfg(target_os = "linux")]
-    config.platform(|config| {
-        config.packet_information(false);
-    });
-
-    // Open the existing device
-    let device = tun::create_as_async(&config)
-        .context("failed to open TUN device")?;
+    // Convert the sync TUN device to async
+    // The device was already created and configured in namespace setup
+    let device = {
+        let tun = tun_device.lock().unwrap();
+        // Get the file descriptor
+        use std::os::unix::io::AsRawFd;
+        let fd = tun.as_raw_fd();
+        
+        // Duplicate the FD for async use
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            anyhow::bail!("failed to duplicate TUN fd");
+        }
+        
+        // Create async device from the duplicated FD
+        unsafe {
+            use std::os::unix::io::FromRawFd;
+            let file = std::fs::File::from_raw_fd(dup_fd);
+            tokio::fs::File::from_std(file)
+        }
+    };
 
     let (mut tun_reader, mut tun_writer) = tokio::io::split(device);
 
@@ -65,6 +81,9 @@ pub async fn run_network_stack(args: &Args, private_key: &str) -> Result<()> {
                         boringtun::noise::TunnResult::Err(e) => {
                             error!("TUN->WG: WireGuard encapsulation error: {:?}", e);
                         }
+                        boringtun::noise::TunnResult::Done => {
+                            debug!("TUN->WG: handshake in progress, packet buffered");
+                        }
                         result => {
                             debug!("TUN->WG: encapsulation result: {:?}", result);
                         }
@@ -74,6 +93,34 @@ pub async fn run_network_stack(args: &Args, private_key: &str) -> Result<()> {
                 Err(e) => {
                     error!("error reading from TUN: {}", e);
                     break;
+                }
+            }
+        }
+    });
+    
+    // Spawn timer task to maintain WireGuard keepalives
+    let wg_tunnel_timer = wg_tunnel.clone_tunnel();
+    let wg_socket_timer = wg_tunnel.clone_socket();
+    let wg_endpoint_timer = wg_tunnel.endpoint();
+    
+    tokio::spawn(async move {
+        debug!("WireGuard timer started");
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+            
+            let mut tunnel = wg_tunnel_timer.lock().await;
+            let mut out_buf = vec![0u8; 148];
+            
+            // Update timers - this may generate handshake packets
+            match tunnel.update_timers(&mut out_buf) {
+                boringtun::noise::TunnResult::WriteToNetwork(data) => {
+                    debug!("Timer: sending {} bytes (keepalive/handshake)", data.len());
+                    let _ = wg_socket_timer.send_to(data, wg_endpoint_timer).await;
+                }
+                boringtun::noise::TunnResult::Done => {}
+                result => {
+                    debug!("Timer: update_timers result: {:?}", result);
                 }
             }
         }

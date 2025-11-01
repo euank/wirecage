@@ -124,11 +124,27 @@ fn stage_two(args: Args) -> Result<()> {
         .trim()
         .to_string();
 
+    // Create UDP socket BEFORE entering network namespace
+    // The socket needs to be in the host network namespace to reach the WireGuard server
+    debug!("creating UDP socket before entering network namespace");
+    let wg_socket_fd = {
+        use std::os::unix::io::AsRawFd;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let fd = socket.as_raw_fd();
+        // Duplicate the FD so it survives the socket being dropped
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            anyhow::bail!("failed to duplicate UDP socket fd");
+        }
+        debug!("UDP socket created in host namespace: fd {}", dup_fd);
+        dup_fd
+    };
+
     // Create network namespace
     namespace::setup_network_namespace(&args)?;
     
     // Create and configure network interface
-    namespace::setup_network_interface(&args)?;
+    let tun_device = namespace::setup_network_interface(&args)?;
 
     // Set up overlay filesystem for /etc
     let _overlay_guard = if !args.no_overlay {
@@ -141,13 +157,13 @@ fn stage_two(args: Args) -> Result<()> {
     // Get command to run
     let command = args.get_command();
 
-    // Set up WireGuard and network stack in background
+    // Set up network stack in background with pre-created UDP socket
     let args_clone = args.clone();
     let private_key_clone = private_key.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
-            if let Err(e) = network::run_network_stack(&args_clone, &private_key_clone).await {
+            if let Err(e) = network::run_network_stack(&args_clone, &private_key_clone, wg_socket_fd, tun_device).await {
                 tracing::error!("network stack error: {}", e);
             }
         });

@@ -1,0 +1,1 @@
+./wirecage --log-level=debug --wg-endpoint "209.251.245.16:51820" --wg-public-key "fHDk+22yah18ytcDFl97kVucKkdhvW3Ykx9qX2DdxUU=" --wg-private-key-file "/home/esk/dev/router.nix/secrets/s" --wg-address "10.101.107.2" -- curl -v  -4 http://example.com

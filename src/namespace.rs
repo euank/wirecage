@@ -32,7 +32,7 @@ pub fn setup_network_namespace(args: &Args) -> Result<()> {
     Ok(())
 }
 
-pub fn setup_network_interface(args: &Args) -> Result<()> {
+pub fn setup_network_interface(args: &Args) -> Result<std::sync::Arc<std::sync::Mutex<tun::platform::Device>>> {
     // Create TUN device
     debug!("creating and configuring TUN device: {}", args.tun);
     let mut config = tun::Configuration::default();
@@ -45,16 +45,14 @@ pub fn setup_network_interface(args: &Args) -> Result<()> {
         config.packet_information(false);
     });
 
-    let _tun = tun::create(&config)
+    let tun = tun::create(&config)
         .context("failed to create TUN device")?;
 
     // Set up networking using rtnetlink
     setup_network_config(args)?;
     
-    // Keep device alive
-    std::mem::forget(_tun);
-
-    Ok(())
+    // Return device wrapped in Arc<Mutex> so it can be shared with network stack
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(tun)))
 }
 
 fn setup_network_config(args: &Args) -> Result<()> {

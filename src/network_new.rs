@@ -188,43 +188,62 @@ pub async fn run_tun_child(
 ) -> Result<()> {
     debug!("TUN child process starting (in network namespace)");
 
-    // Keep the TUN device - we'll use blocking I/O
-    // This is simpler and avoids async file descriptor issues
+    // Create separate file descriptors for read and write
+    // Sharing a single FD between reader/writer causes blocking issues
+    let (tun_read_fd, tun_write_fd) = {
+        let tun = tun_device.lock().unwrap();
+        use std::os::unix::io::AsRawFd;
+        let fd = tun.as_raw_fd();
+        
+        // Duplicate FD for writer
+        let write_fd = unsafe { libc::dup(fd) };
+        if write_fd < 0 {
+            panic!("failed to duplicate TUN fd for writer");
+        }
+        
+        // Set non-blocking mode on both
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            let flags = libc::fcntl(write_fd, libc::F_GETFL);
+            libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        
+        (fd, write_fd)
+    };
 
-    // Task: Read from TUN, send to WireGuard (using blocking I/O)
-    let tun_read = Arc::clone(&tun_device);
+    // Task: Read from TUN, send to WireGuard (using raw FD)
     tokio::task::spawn_blocking(move || {
-        use std::io::Read;
         debug!("TUN reader started (blocking)");
         let mut buf = vec![0u8; 2048];
         loop {
-            let mut tun = tun_read.lock().unwrap();
-            match tun.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    drop(tun); // Release lock
-                    debug!("TUN: read {} bytes", n);
-                    let packet = buf[..n].to_vec();
-                    if tun_to_wg_tx.blocking_send(packet).is_err() {
-                        error!("TUN: failed to send to channel");
-                        break;
-                    }
-                }
-                Ok(_) => {
-                    drop(tun);
-                }
-                Err(e) => {
-                    error!("TUN: read error: {}", e);
+            let n = unsafe { libc::read(tun_read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            
+            if n > 0 {
+                debug!("TUN: read {} bytes", n);
+                let packet = buf[..n as usize].to_vec();
+                if tun_to_wg_tx.blocking_send(packet).is_err() {
+                    error!("TUN: failed to send to channel");
                     break;
                 }
+            } else if n == 0 {
+                debug!("TUN: EOF");
+                break;
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                error!("TUN: read error: {}", err);
+                break;
             }
         }
     });
 
-    // Task: Receive from WireGuard, write to TUN (using blocking I/O)
-    let tun_write = Arc::clone(&tun_device);
+    // Task: Receive from WireGuard, write to TUN (using raw FD)
     let mut wg_to_tun_rx = wg_to_tun_rx;
     tokio::task::spawn_blocking(move || {
-        use std::io::Write;
         debug!("TUN writer started (blocking)");
         let mut count = 0u32;
         loop {
@@ -233,16 +252,18 @@ pub async fn run_tun_child(
                     count += 1;
                     debug!("TUN: writing {} bytes (packet #{})", packet.len(), count);
                     
-                    let mut tun = tun_write.lock().unwrap();
-                    match tun.write_all(&packet) {
-                        Ok(()) => {
-                            debug!("TUN: write successful");
-                            let _ = tun.flush();
-                        }
-                        Err(e) => {
-                            error!("TUN: write error: {}", e);
-                            break;
-                        }
+                    let written = unsafe { 
+                        libc::write(tun_write_fd, packet.as_ptr() as *const libc::c_void, packet.len())
+                    };
+                    
+                    if written < 0 {
+                        let err = std::io::Error::last_os_error();
+                        error!("TUN: write error: {}", err);
+                        break;
+                    } else if written != packet.len() as isize {
+                        error!("TUN: partial write: {} of {} bytes", written, packet.len());
+                    } else {
+                        debug!("TUN: write successful ({} bytes)", written);
                     }
                 }
                 None => {

@@ -14,9 +14,13 @@ pub async fn run_network_stack(
     args: &Args, 
     private_key: &str,
     wg_socket_fd: std::os::unix::io::RawFd,
+    host_netns_fd: std::fs::File,
     tun_device: std::sync::Arc<std::sync::Mutex<tun::platform::Device>>
 ) -> Result<()> {
     debug!("network stack starting with pre-created UDP socket");
+    
+    use std::os::unix::io::AsRawFd;
+    let netns_fd = host_netns_fd.as_raw_fd();
     
     // Create WireGuard tunnel using the pre-created socket from host namespace
     let wg_tunnel = WireGuardTunnel::new_from_fd(
@@ -127,15 +131,29 @@ pub async fn run_network_stack(
     });
 
     // Spawn task to forward packets from WireGuard to TUN
+    // This task must run in the HOST network namespace to receive UDP packets
     let wg_tunnel_rx = wg_tunnel.clone_tunnel();
     let wg_socket_rx = wg_tunnel.clone_socket();
     
-    tokio::spawn(async move {
+    tokio::task::spawn_blocking(move || {
+        // Switch back to host network namespace to receive packets  
+        unsafe {
+            if libc::setns(netns_fd, libc::CLONE_NEWNET) < 0 {
+                error!("failed to setns to host namespace: {}", std::io::Error::last_os_error());
+                return;
+            }
+        }
+        debug!("WG->TUN receiver task switched to host network namespace");
+        
+        // Now create a tokio runtime in THIS thread (which is in the host netns)
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
         let mut recv_buf = vec![0u8; 2048];
         let mut decap_buf = vec![0u8; 2048];
         debug!("WG->TUN forwarder started");
         
         loop {
+            debug!("WG->TUN: waiting for packet on recv_from...");
             match wg_socket_rx.recv_from(&mut recv_buf).await {
                 Ok((n, addr)) => {
                     debug!("WG->TUN: received {} bytes from WireGuard (from {})", n, addr);
@@ -165,6 +183,7 @@ pub async fn run_network_stack(
                 }
             }
         }
+        });
     });
 
     // Keep running

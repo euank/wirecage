@@ -124,6 +124,11 @@ fn stage_two(args: Args) -> Result<()> {
         .trim()
         .to_string();
 
+    // Save the current (host) network namespace before creating a new one
+    debug!("saving host network namespace");
+    let host_netns_fd = std::fs::File::open("/proc/self/ns/net")
+        .context("failed to open host network namespace")?;
+    
     // Create UDP socket BEFORE entering network namespace
     // The socket needs to be in the host network namespace to reach the WireGuard server
     debug!("creating UDP socket before entering network namespace");
@@ -140,7 +145,7 @@ fn stage_two(args: Args) -> Result<()> {
         dup_fd
     };
 
-    // Create network namespace
+    // Create network namespace (we're now in a NEW network namespace)
     namespace::setup_network_namespace(&args)?;
     
     // Create and configure network interface
@@ -163,7 +168,7 @@ fn stage_two(args: Args) -> Result<()> {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
-            if let Err(e) = network::run_network_stack(&args_clone, &private_key_clone, wg_socket_fd, tun_device).await {
+            if let Err(e) = network::run_network_stack(&args_clone, &private_key_clone, wg_socket_fd, host_netns_fd, tun_device).await {
                 tracing::error!("network stack error: {}", e);
             }
         });

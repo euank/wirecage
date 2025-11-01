@@ -116,11 +116,12 @@ pub async fn run_wireguard_host(
     let wg_socket_timer = wg_tunnel.clone_socket();
     let wg_endpoint_timer = wg_tunnel.endpoint();
 
-    tokio::spawn(async move {
+    let timer_handle = tokio::spawn(async move {
         debug!("WireGuard timer started");
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
             interval.tick().await;
+            debug!("Timer: tick");
 
             let mut tunnel = wg_tunnel_timer.lock().await;
             let mut out_buf = vec![0u8; 148];
@@ -136,8 +137,8 @@ pub async fn run_wireguard_host(
         }
     });
 
-    // Keep running
-    tokio::signal::ctrl_c().await?;
+    // Keep running until the timer task completes (which is never)
+    timer_handle.await?;
     Ok(())
 }
 

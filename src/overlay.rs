@@ -38,10 +38,10 @@ pub fn setup_etc_overlay(gateway: &str) -> Result<OverlayGuard> {
     std::fs::create_dir_all(&layerdir)
         .context("failed to create layer directory")?;
 
-    // Create resolv.conf in layer
+    // Create resolv.conf in layer pointing to public DNS (will route via WireGuard)
     std::fs::write(
         layerdir.join("resolv.conf"),
-        format!("nameserver {}\n", gateway),
+        "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
     )
     .context("failed to write resolv.conf")?;
 

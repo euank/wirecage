@@ -217,7 +217,9 @@ fn stage_two(args: Args) -> Result<()> {
     // Wait for child to complete
     let status = child.wait().context("failed to wait for child")?;
 
-    wg_handle.join();
+    debug!("child exited with status: {:?}", status);
+    
+    // Don't join wg_handle - it's running forever and will be terminated when we exit
     // Exit with the same code as the child
     std::process::exit(status.code().unwrap_or(1))
 }

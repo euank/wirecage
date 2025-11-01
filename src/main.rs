@@ -1,6 +1,7 @@
 mod args;
 mod namespace;
 mod network;
+mod network_new;
 mod overlay;
 mod wireguard;
 
@@ -124,31 +125,39 @@ fn stage_two(args: Args) -> Result<()> {
         .trim()
         .to_string();
 
-    // Save the current (host) network namespace before creating a new one
-    debug!("saving host network namespace");
-    let host_netns_fd = std::fs::File::open("/proc/self/ns/net")
-        .context("failed to open host network namespace")?;
-    
-    // Create UDP socket BEFORE entering network namespace
-    // The socket needs to be in the host network namespace to reach the WireGuard server
-    debug!("creating UDP socket before entering network namespace");
-    let wg_socket_fd = {
-        use std::os::unix::io::AsRawFd;
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        let fd = socket.as_raw_fd();
-        // Duplicate the FD so it survives the socket being dropped
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            anyhow::bail!("failed to duplicate UDP socket fd");
-        }
-        debug!("UDP socket created in host namespace: fd {}", dup_fd);
-        dup_fd
-    };
+    // Create channels for communication between host WireGuard and child TUN
+    use tokio::sync::mpsc;
+    let (tun_to_wg_tx, tun_to_wg_rx) = mpsc::channel(100);
+    let (wg_to_tun_tx, wg_to_tun_rx) = mpsc::channel(100);
 
-    // Create network namespace (we're now in a NEW network namespace)
+    // Start WireGuard in HOST namespace in a dedicated thread
+    // This thread will stay in the host network namespace
+    debug!("starting WireGuard in host namespace");
+    let args_wg = args.clone();
+    let private_key_wg = private_key.clone();
+    let wg_handle = std::thread::spawn(move || {
+        // This thread is in the host network namespace and will stay there
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        
+        runtime.block_on(async move {
+            debug!("WireGuard runtime started");
+            if let Err(e) = network_new::run_wireguard_host(&args_wg, &private_key_wg, tun_to_wg_rx, wg_to_tun_tx).await {
+                tracing::error!("WireGuard host error: {}", e);
+            }
+        });
+    });
+
+    // Give WireGuard time to initialize  
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Now create network namespace (we enter a NEW network namespace)
+    debug!("creating network namespace");
     namespace::setup_network_namespace(&args)?;
     
-    // Create and configure network interface
+    // Create and configure TUN interface in new namespace
     let tun_device = namespace::setup_network_interface(&args)?;
 
     // Set up overlay filesystem for /etc
@@ -159,23 +168,23 @@ fn stage_two(args: Args) -> Result<()> {
         None
     };
 
-    // Get command to run
-    let command = args.get_command();
-
-    // Set up network stack in background with pre-created UDP socket
-    let args_clone = args.clone();
-    let private_key_clone = private_key.clone();
+    // Start TUN/network stack in CHILD namespace
+    debug!("starting TUN child in network namespace");
+    let args_tun = args.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
-            if let Err(e) = network::run_network_stack(&args_clone, &private_key_clone, wg_socket_fd, host_netns_fd, tun_device).await {
-                tracing::error!("network stack error: {}", e);
+            if let Err(e) = network_new::run_tun_child(&args_tun, tun_to_wg_tx, wg_to_tun_rx, tun_device).await {
+                tracing::error!("TUN child error: {}", e);
             }
         });
     });
 
     // Give network stack time to initialize
     std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Get command to run
+    let command = args.get_command();
 
     // We're already running as the correct user:
     // - We're UID 0 in the user namespace

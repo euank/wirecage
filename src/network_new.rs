@@ -188,40 +188,30 @@ pub async fn run_tun_child(
 ) -> Result<()> {
     debug!("TUN child process starting (in network namespace)");
 
-    // Convert TUN device to async
-    let device = {
-        let tun = tun_device.lock().unwrap();
-        use std::os::unix::io::AsRawFd;
-        let fd = tun.as_raw_fd();
+    // Keep the TUN device - we'll use blocking I/O
+    // This is simpler and avoids async file descriptor issues
 
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            anyhow::bail!("failed to duplicate TUN fd");
-        }
-
-        unsafe {
-            use std::os::unix::io::FromRawFd;
-            let file = std::fs::File::from_raw_fd(dup_fd);
-            tokio::fs::File::from_std(file)
-        }
-    };
-
-    let (mut tun_reader, mut tun_writer) = tokio::io::split(device);
-
-    // Task: Read from TUN, send to WireGuard
-    tokio::spawn(async move {
-        debug!("TUN reader started");
+    // Task: Read from TUN, send to WireGuard (using blocking I/O)
+    let tun_read = Arc::clone(&tun_device);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        debug!("TUN reader started (blocking)");
         let mut buf = vec![0u8; 2048];
         loop {
-            match tokio::io::AsyncReadExt::read(&mut tun_reader, &mut buf).await {
+            let mut tun = tun_read.lock().unwrap();
+            match tun.read(&mut buf) {
                 Ok(n) if n > 0 => {
+                    drop(tun); // Release lock
                     debug!("TUN: read {} bytes", n);
-                    if let Err(e) = tun_to_wg_tx.send(buf[..n].to_vec()).await {
-                        error!("TUN: failed to send to channel: {}", e);
+                    let packet = buf[..n].to_vec();
+                    if tun_to_wg_tx.blocking_send(packet).is_err() {
+                        error!("TUN: failed to send to channel");
                         break;
                     }
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    drop(tun);
+                }
                 Err(e) => {
                     error!("TUN: read error: {}", e);
                     break;
@@ -230,28 +220,33 @@ pub async fn run_tun_child(
         }
     });
 
-    // Task: Receive from WireGuard, write to TUN
+    // Task: Receive from WireGuard, write to TUN (using blocking I/O)
+    let tun_write = Arc::clone(&tun_device);
     let mut wg_to_tun_rx = wg_to_tun_rx;
-    tokio::spawn(async move {
-        debug!("TUN writer started");
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        debug!("TUN writer started (blocking)");
         let mut count = 0u32;
-        while let Some(packet) = wg_to_tun_rx.recv().await {
-            count += 1;
-            debug!("TUN: writing {} bytes (packet #{})", packet.len(), count);
-            
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                tokio::io::AsyncWriteExt::write_all(&mut tun_writer, &packet)
-            ).await {
-                Ok(Ok(())) => {
-                    debug!("TUN: write successful");
+        loop {
+            match wg_to_tun_rx.blocking_recv() {
+                Some(packet) => {
+                    count += 1;
+                    debug!("TUN: writing {} bytes (packet #{})", packet.len(), count);
+                    
+                    let mut tun = tun_write.lock().unwrap();
+                    match tun.write_all(&packet) {
+                        Ok(()) => {
+                            debug!("TUN: write successful");
+                            let _ = tun.flush();
+                        }
+                        Err(e) => {
+                            error!("TUN: write error: {}", e);
+                            break;
+                        }
+                    }
                 }
-                Ok(Err(e)) => {
-                    error!("TUN: write error: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    error!("TUN: write timeout!");
+                None => {
+                    debug!("TUN writer channel closed");
                     break;
                 }
             }

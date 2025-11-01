@@ -105,12 +105,18 @@ pub async fn run_wireguard_host(
                     match tunnel.decapsulate(None, &recv_buf[..n], &mut decap_buf) {
                         boringtun::noise::TunnResult::WriteToTunnelV4(data, _)
                         | boringtun::noise::TunnResult::WriteToTunnelV6(data, _) => {
-                            debug!("WG->TUN: decapsulated {} bytes, sending to channel", data.len());
+                            debug!("WG->TUN: decapsulated {} bytes IP packet, sending to channel", data.len());
                             if let Err(e) = wg_to_tun_tx.send(data.to_vec()).await {
                                 error!("WG->TUN: channel send error: {}", e);
                                 break;
                             } else {
                                 debug!("WG->TUN: sent to channel successfully");
+                            }
+                        }
+                        boringtun::noise::TunnResult::WriteToNetwork(data) => {
+                            debug!("WG->TUN: got WireGuard protocol message, sending back {} bytes", data.len());
+                            if let Err(e) = wg_socket_rx.send_to(data, addr).await {
+                                error!("WG->TUN: failed to send protocol message: {}", e);
                             }
                         }
                         boringtun::noise::TunnResult::Err(e) => {

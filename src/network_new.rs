@@ -234,11 +234,20 @@ pub async fn run_tun_child(
     let mut wg_to_tun_rx = wg_to_tun_rx;
     tokio::spawn(async move {
         debug!("TUN writer started");
+        let mut count = 0u32;
         while let Some(packet) = wg_to_tun_rx.recv().await {
-            debug!("TUN: writing {} bytes", packet.len());
+            count += 1;
+            debug!("TUN: writing {} bytes (packet #{})", packet.len(), count);
             if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut tun_writer, &packet).await {
                 error!("TUN: write error: {}", e);
                 break;
+            } else {
+                debug!("TUN: write successful");
+            }
+            
+            // Also flush to ensure packet is sent
+            if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut tun_writer).await {
+                error!("TUN: flush error: {}", e);
             }
         }
     });

@@ -8,6 +8,10 @@
 !**/secrets/*.go
 /out
 
+# Rust
+/target
+Cargo.lock
+
 # Devenv
 .devenv*
 devenv.local.nix

@@ -1,0 +1,181 @@
+mod args;
+mod namespace;
+mod network;
+mod overlay;
+mod wireguard;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+use tracing::debug;
+
+use args::Args;
+use namespace::Stage;
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(&args.log_level)
+                }),
+        )
+        .init();
+
+    // Determine which stage we're at based on argv[0]
+    let stage = Stage::from_argv0()?;
+
+    match stage {
+        Stage::One => stage_one(args),
+        Stage::Two => stage_two(args),
+    }
+}
+
+fn stage_one(args: Args) -> Result<()> {
+    debug!("at first stage, launching second stage in a new user namespace...");
+
+    // Determine target UID/GID
+    let (uid, gid) = args.resolve_target_user()?;
+
+    // Get current UID/GID before we clone
+    let current_uid = nix::unistd::getuid();
+    let current_gid = nix::unistd::getgid();
+
+    // Use clone with CLONE_NEWUSER to create child in new user namespace
+    use nix::sched::{clone, CloneFlags};
+    use nix::sys::signal::Signal;
+
+    const STACK_SIZE: usize = 1024 * 1024;
+    let mut stack = vec![0u8; STACK_SIZE];
+
+    let flags = CloneFlags::CLONE_NEWUSER;
+
+    let child_pid = unsafe {
+        clone(
+            Box::new(|| {
+                // Child process - we're now in a new user namespace
+                // Wait for parent to write uid/gid maps
+                std::thread::sleep(std::time::Duration::from_millis(50));
+
+                // Exec into stage 2
+                let err = Command::new("/proc/self/exe")
+                    .args(std::env::args().skip(1))
+                    .env("WIRECAGE_STAGE", "2")
+                    .env("WIRECAGE_UID", uid.to_string())
+                    .env("WIRECAGE_GID", gid.to_string())
+                    .exec();
+
+                eprintln!("exec failed: {}", err);
+                1 // Return error code
+            }),
+            &mut stack,
+            flags,
+            Some(Signal::SIGCHLD as i32),
+        )?
+    };
+
+    // Parent process: set up uid_map and gid_map for child
+    debug!("parent: setting up uid/gid maps for child {}", child_pid);
+
+    // Write uid_map
+    std::fs::write(
+        format!("/proc/{}/uid_map", child_pid),
+        format!("0 {} 1", current_uid),
+    )?;
+
+    // Disable setgroups
+    std::fs::write(
+        format!("/proc/{}/setgroups", child_pid),
+        "deny",
+    )?;
+
+    // Write gid_map
+    std::fs::write(
+        format!("/proc/{}/gid_map", child_pid),
+        format!("0 {} 1", current_gid),
+    )?;
+
+    // Wait for child
+    match nix::sys::wait::waitpid(child_pid, None)? {
+        nix::sys::wait::WaitStatus::Exited(_, code) => {
+            std::process::exit(code);
+        }
+        nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
+            std::process::exit(128 + sig as i32);
+        }
+        _ => {
+            std::process::exit(1);
+        }
+    }
+}
+
+fn stage_two(args: Args) -> Result<()> {
+    debug!("at second stage");
+
+    // Validate required arguments
+    args.validate()?;
+
+    // Read private key
+    let private_key = std::fs::read_to_string(&args.wg_private_key_file)
+        .context("failed to read private key file")?
+        .trim()
+        .to_string();
+
+    // Create network namespace
+    namespace::setup_network_namespace(&args)?;
+    
+    // Create and configure network interface
+    namespace::setup_network_interface(&args)?;
+
+    // Set up overlay filesystem for /etc
+    let _overlay_guard = if !args.no_overlay {
+        debug!("overlaying /etc...");
+        Some(overlay::setup_etc_overlay(&args.gateway)?)
+    } else {
+        None
+    };
+
+    // Get command to run
+    let command = args.get_command();
+
+    // Set up WireGuard and network stack in background
+    let args_clone = args.clone();
+    let private_key_clone = private_key.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            if let Err(e) = network::run_network_stack(&args_clone, &private_key_clone).await {
+                tracing::error!("network stack error: {}", e);
+            }
+        });
+    });
+
+    // Give network stack time to initialize
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // We're already running as the correct user:
+    // - We're UID 0 in the user namespace
+    // - UID 0 maps to the original host UID (from stage 1)
+    // - So we're effectively running as the user who invoked wirecage
+    debug!("running as uid {} gid {} in namespace (maps to host uid {} gid {})", 
+           nix::unistd::getuid(), nix::unistd::getgid(), args.uid, args.gid);
+
+    // Prepare environment
+    let mut env = std::env::vars().collect::<Vec<_>>();
+    env.push(("PS1".to_string(), "wirecage # ".to_string()));
+    env.push(("wirecage".to_string(), "1".to_string()));
+
+    debug!("execing command: {:?}", command);
+
+    // Exec the target command (replaces this process)
+    let err = Command::new(&command[0])
+        .args(&command[1..])
+        .env_clear()
+        .envs(env)
+        .exec();
+
+    Err(anyhow::anyhow!("exec failed: {}", err))
+}

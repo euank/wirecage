@@ -142,7 +142,7 @@ fn stage_two(args: Args) -> Result<()> {
             .enable_all()
             .build()
             .unwrap();
-        
+
         runtime.block_on(async move {
             debug!("WireGuard runtime started");
             if let Err(e) = network_new::run_wireguard_host(&args_wg, &private_key_wg, tun_to_wg_rx, wg_to_tun_tx).await {
@@ -151,13 +151,13 @@ fn stage_two(args: Args) -> Result<()> {
         });
     });
 
-    // Give WireGuard time to initialize  
+    // Give WireGuard time to initialize
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Now create network namespace (we enter a NEW network namespace)
     debug!("creating network namespace");
     namespace::setup_network_namespace(&args)?;
-    
+
     // Create and configure TUN interface in new namespace
     let tun_device = namespace::setup_network_interface(&args)?;
 
@@ -178,7 +178,7 @@ fn stage_two(args: Args) -> Result<()> {
             .enable_all()
             .build()
             .unwrap();
-        
+
         runtime.block_on(async move {
             if let Err(e) = network_new::run_tun_child(&args_tun, tun_to_wg_tx, wg_to_tun_rx, tun_device).await {
                 tracing::error!("TUN child error: {}", e);
@@ -196,7 +196,7 @@ fn stage_two(args: Args) -> Result<()> {
     // - We're UID 0 in the user namespace
     // - UID 0 maps to the original host UID (from stage 1)
     // - So we're effectively running as the user who invoked wirecage
-    debug!("running as uid {} gid {} in namespace (maps to host uid {} gid {})", 
+    debug!("running as uid {} gid {} in namespace (maps to host uid {} gid {})",
            nix::unistd::getuid(), nix::unistd::getgid(), args.uid, args.gid);
 
     // Prepare environment
@@ -217,6 +217,7 @@ fn stage_two(args: Args) -> Result<()> {
     // Wait for child to complete
     let status = child.wait().context("failed to wait for child")?;
 
+    wg_handle.join();
     // Exit with the same code as the child
     std::process::exit(status.code().unwrap_or(1))
 }

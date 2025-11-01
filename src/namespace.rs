@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use nix::sched::{unshare, CloneFlags};
-use nix::sys::socket::{AddressFamily, SockFlag, SockType};
 use tracing::debug;
 
 use crate::args::Args;
@@ -20,7 +19,7 @@ impl Stage {
     }
 }
 
-pub fn setup_network_namespace(args: &Args) -> Result<()> {
+pub fn setup_network_namespace(_args: &Args) -> Result<()> {
     // Create a new network namespace
     debug!("creating network namespace");
     unshare(CloneFlags::CLONE_NEWNET)
@@ -57,7 +56,7 @@ pub fn setup_network_interface(args: &Args) -> Result<std::sync::Arc<std::sync::
 
 fn setup_network_config(args: &Args) -> Result<()> {
     use futures::stream::TryStreamExt;
-    use rtnetlink::{new_connection, Handle};
+    use rtnetlink::new_connection;
 
     let rt = tokio::runtime::Runtime::new()?;
     

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 
 	"go.euank.com/wireguard/conn"
 	"go.euank.com/wireguard/device"
@@ -85,8 +86,20 @@ func (wg *wireguardProxy) ProxyConn(ctx context.Context, network string, addr ne
 		return
 	}
 	slog.Debug("proxy start", "addr", addr)
-	go proxyBytes(subprocess, conn)
-	go proxyBytes(conn, subprocess)
+	defer slog.Debug("proxy done", "addr", addr)
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		proxyBytes(subprocess, conn)
+		subprocess.(CloseWriter).CloseWrite()
+	}()
+	go func() {
+		defer wait.Done()
+		proxyBytes(conn, subprocess)
+		conn.(CloseWriter).CloseWrite()
+	}()
+	wait.Wait()
 }
 
 // proxyBytes copies data between the world and the subprocess
@@ -98,3 +111,9 @@ func proxyBytes(w io.Writer, r io.Reader) {
 		slog.Debug("copied bytes", "n", n)
 	}
 }
+
+type CloseWriter interface {
+	CloseWrite() error
+}
+
+var _ CloseWriter = &net.TCPConn{}

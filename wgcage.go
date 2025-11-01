@@ -343,7 +343,7 @@ func run(ctx context.Context) error {
 	}
 
 	// create the TCP forwarder, which accepts gvisor connections and notifies the mux
-	const maxInFlight = 100 // maximum simultaneous connections
+	const maxInFlight = 100000 // maximum simultaneous connections
 	tcpForwarder := tcp.NewForwarder(s, 0, maxInFlight, func(r *tcp.ForwarderRequest) {
 		// remote address is the IP address of the subprocess
 		// local address is IP address that the subprocess was trying to reach

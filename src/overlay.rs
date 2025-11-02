@@ -27,16 +27,14 @@ pub fn setup_etc_overlay(gateway: &str) -> Result<OverlayGuard> {
         .prefix("overlay-")
         .tempdir()
         .context("failed to create temp directory")?;
-    
+
     let tmpdir_path = tmpdir.into_path();
 
     let workdir = tmpdir_path.join("work");
     let layerdir = tmpdir_path.join("layer");
 
-    std::fs::create_dir_all(&workdir)
-        .context("failed to create work directory")?;
-    std::fs::create_dir_all(&layerdir)
-        .context("failed to create layer directory")?;
+    std::fs::create_dir_all(&workdir).context("failed to create work directory")?;
+    std::fs::create_dir_all(&layerdir).context("failed to create layer directory")?;
 
     // Create resolv.conf in layer pointing to public DNS (will route via WireGuard)
     std::fs::write(
@@ -77,5 +75,7 @@ pub fn setup_etc_overlay(gateway: &str) -> Result<OverlayGuard> {
     )
     .context("failed to mount overlay filesystem")?;
 
-    Ok(OverlayGuard { tmpdir: tmpdir_path })
+    Ok(OverlayGuard {
+        tmpdir: tmpdir_path,
+    })
 }

@@ -22,34 +22,32 @@ impl Stage {
 pub fn setup_network_namespace(_args: &Args) -> Result<()> {
     // Create a new network namespace
     debug!("creating network namespace");
-    unshare(CloneFlags::CLONE_NEWNET)
-        .context("failed to unshare network namespace")?;
+    unshare(CloneFlags::CLONE_NEWNET).context("failed to unshare network namespace")?;
 
     // Note: TUN device will be created by the network stack
     // We just set up the namespace here
-    
+
     Ok(())
 }
 
-pub fn setup_network_interface(args: &Args) -> Result<std::sync::Arc<std::sync::Mutex<tun::platform::Device>>> {
+pub fn setup_network_interface(
+    args: &Args,
+) -> Result<std::sync::Arc<std::sync::Mutex<tun::platform::Device>>> {
     // Create TUN device
     debug!("creating and configuring TUN device: {}", args.tun);
     let mut config = tun::Configuration::default();
-    config
-        .name(&args.tun)
-        .up();
+    config.name(&args.tun).up();
 
     #[cfg(target_os = "linux")]
     config.platform(|config| {
         config.packet_information(false);
     });
 
-    let tun = tun::create(&config)
-        .context("failed to create TUN device")?;
+    let tun = tun::create(&config).context("failed to create TUN device")?;
 
     // Set up networking using rtnetlink
     setup_network_config(args)?;
-    
+
     // Return device wrapped in Arc<Mutex> so it can be shared with network stack
     Ok(std::sync::Arc::new(std::sync::Mutex::new(tun)))
 }
@@ -59,20 +57,17 @@ fn setup_network_config(args: &Args) -> Result<()> {
     use rtnetlink::new_connection;
 
     let rt = tokio::runtime::Runtime::new()?;
-    
+
     rt.block_on(async {
-        let (connection, handle, _) = new_connection()
-            .context("failed to create netlink connection")?;
-        
+        let (connection, handle, _) =
+            new_connection().context("failed to create netlink connection")?;
+
         tokio::spawn(connection);
 
         // Find the TUN device
         let mut links = handle.link().get().match_name(args.tun.clone()).execute();
-        let link = links
-            .try_next()
-            .await?
-            .context("TUN device not found")?;
-        
+        let link = links.try_next().await?.context("TUN device not found")?;
+
         let link_index = link.header.index;
         debug!("TUN device index: {}", link_index);
 
@@ -87,16 +82,18 @@ fn setup_network_config(args: &Args) -> Result<()> {
 
         // Use the WireGuard address as the TUN IP (not the subnet arg)
         // The server's allowed_ips must match this
-        let wg_addr: std::net::IpAddr = args.wg_address.parse()
-            .context("invalid wg-address")?;
-        
+        let wg_addr: std::net::IpAddr = args.wg_address.parse().context("invalid wg-address")?;
+
         let addr = wg_addr;
         let prefix_len = match addr {
             std::net::IpAddr::V4(_) => 24,
             std::net::IpAddr::V6(_) => 64,
         };
-        
-        debug!("Setting TUN IP to WireGuard address: {}/{}", addr, prefix_len);
+
+        debug!(
+            "Setting TUN IP to WireGuard address: {}/{}",
+            addr, prefix_len
+        );
 
         handle
             .address()
@@ -104,7 +101,7 @@ fn setup_network_config(args: &Args) -> Result<()> {
             .execute()
             .await
             .context("failed to add address to TUN device")?;
-        
+
         // Also add a link-local IPv6 address for IPv6 connectivity
         let ipv6_addr = std::net::Ipv6Addr::new(0xfd42, 0x42, 0x42, 0, 0, 0, 0, 2);
         debug!("Adding IPv6 address: {}/64", ipv6_addr);
@@ -138,12 +135,7 @@ fn setup_network_config(args: &Args) -> Result<()> {
         // Find and bring up loopback
         let mut lo_links = handle.link().get().match_name("lo".to_string()).execute();
         if let Ok(Some(lo_link)) = lo_links.try_next().await {
-            let _ = handle
-                .link()
-                .set(lo_link.header.index)
-                .up()
-                .execute()
-                .await;
+            let _ = handle.link().set(lo_link.header.index).up().execute().await;
         }
 
         Ok::<(), anyhow::Error>(())

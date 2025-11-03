@@ -19,9 +19,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    tracing_subscriber::EnvFilter::new(&args.log_level)
-                }),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level)),
         )
         .init();
 
@@ -87,10 +85,7 @@ fn stage_one(args: Args) -> Result<()> {
     )?;
 
     // Disable setgroups
-    std::fs::write(
-        format!("/proc/{}/setgroups", child_pid),
-        "deny",
-    )?;
+    std::fs::write(format!("/proc/{}/setgroups", child_pid), "deny")?;
 
     // Write gid_map
     std::fs::write(
@@ -144,7 +139,14 @@ fn stage_two(args: Args) -> Result<()> {
 
         runtime.block_on(async move {
             debug!("WireGuard runtime started");
-            if let Err(e) = network_new::run_wireguard_host(&args_wg, &private_key_wg, tun_to_wg_rx, wg_to_tun_tx).await {
+            if let Err(e) = network_new::run_wireguard_host(
+                &args_wg,
+                &private_key_wg,
+                tun_to_wg_rx,
+                wg_to_tun_tx,
+            )
+            .await
+            {
                 tracing::error!("WireGuard host error: {}", e);
             }
         });
@@ -179,7 +181,9 @@ fn stage_two(args: Args) -> Result<()> {
             .unwrap();
 
         runtime.block_on(async move {
-            if let Err(e) = network_new::run_tun_child(&args_tun, tun_to_wg_tx, wg_to_tun_rx, tun_device).await {
+            if let Err(e) =
+                network_new::run_tun_child(&args_tun, tun_to_wg_tx, wg_to_tun_rx, tun_device).await
+            {
                 tracing::error!("TUN child error: {}", e);
             }
         });
@@ -195,8 +199,13 @@ fn stage_two(args: Args) -> Result<()> {
     // - We're UID 0 in the user namespace
     // - UID 0 maps to the original host UID (from stage 1)
     // - So we're effectively running as the user who invoked wirecage
-    debug!("running as uid {} gid {} in namespace (maps to host uid {} gid {})",
-           nix::unistd::getuid(), nix::unistd::getgid(), args.uid, args.gid);
+    debug!(
+        "running as uid {} gid {} in namespace (maps to host uid {} gid {})",
+        nix::unistd::getuid(),
+        nix::unistd::getgid(),
+        args.uid,
+        args.gid
+    );
 
     // Prepare environment
     let mut env = std::env::vars().collect::<Vec<_>>();

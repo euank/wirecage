@@ -38,7 +38,11 @@ pub struct Args {
     )]
     pub no_overlay: bool,
 
-    #[arg(long, default_value = "info", help = "log level (debug, info, warn, error)")]
+    #[arg(
+        long,
+        default_value = "info",
+        help = "log level (debug, info, warn, error)"
+    )]
     pub log_level: String,
 
     #[arg(long = "wg-public-key", help = "wireguard server public key")]

@@ -86,7 +86,10 @@ pub async fn run_wireguard_host(
     // Task: Forward packets from WireGuard socket to TUN (via channel)
     let recv_handle = tokio::spawn(async move {
         let local_addr = wg_socket_rx.local_addr().unwrap();
-        debug!("WG->TUN forwarder started (host namespace), listening on {}", local_addr);
+        debug!(
+            "WG->TUN forwarder started (host namespace), listening on {}",
+            local_addr
+        );
         let mut recv_buf = vec![0u8; 2048];
         let mut decap_buf = vec![0u8; 2048];
         let mut counter = 0u32;
@@ -96,8 +99,10 @@ pub async fn run_wireguard_host(
             debug!("WG->TUN: calling recv_from (attempt {})...", counter);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                wg_socket_rx.recv_from(&mut recv_buf)
-            ).await {
+                wg_socket_rx.recv_from(&mut recv_buf),
+            )
+            .await
+            {
                 Ok(Ok((n, addr))) => {
                     debug!("WG->TUN: received {} bytes from {}", n, addr);
 
@@ -105,7 +110,10 @@ pub async fn run_wireguard_host(
                     match tunnel.decapsulate(None, &recv_buf[..n], &mut decap_buf) {
                         boringtun::noise::TunnResult::WriteToTunnelV4(data, _)
                         | boringtun::noise::TunnResult::WriteToTunnelV6(data, _) => {
-                            debug!("WG->TUN: decapsulated {} bytes IP packet, sending to channel", data.len());
+                            debug!(
+                                "WG->TUN: decapsulated {} bytes IP packet, sending to channel",
+                                data.len()
+                            );
                             if let Err(e) = wg_to_tun_tx.send(data.to_vec()).await {
                                 error!("WG->TUN: channel send error: {}", e);
                                 break;
@@ -114,7 +122,10 @@ pub async fn run_wireguard_host(
                             }
                         }
                         boringtun::noise::TunnResult::WriteToNetwork(data) => {
-                            debug!("WG->TUN: got WireGuard protocol message, sending back {} bytes", data.len());
+                            debug!(
+                                "WG->TUN: got WireGuard protocol message, sending back {} bytes",
+                                data.len()
+                            );
                             if let Err(e) = wg_socket_rx.send_to(data, addr).await {
                                 error!("WG->TUN: failed to send protocol message: {}", e);
                             }
@@ -194,13 +205,13 @@ pub async fn run_tun_child(
         let tun = tun_device.lock().unwrap();
         use std::os::unix::io::AsRawFd;
         let fd = tun.as_raw_fd();
-        
+
         // Duplicate FD for writer
         let write_fd = unsafe { libc::dup(fd) };
         if write_fd < 0 {
             panic!("failed to duplicate TUN fd for writer");
         }
-        
+
         // Set non-blocking mode on both
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -208,7 +219,7 @@ pub async fn run_tun_child(
             let flags = libc::fcntl(write_fd, libc::F_GETFL);
             libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-        
+
         (fd, write_fd)
     };
 
@@ -217,8 +228,14 @@ pub async fn run_tun_child(
         debug!("TUN reader started (blocking)");
         let mut buf = vec![0u8; 2048];
         loop {
-            let n = unsafe { libc::read(tun_read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            
+            let n = unsafe {
+                libc::read(
+                    tun_read_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+
             if n > 0 {
                 debug!("TUN: read {} bytes", n);
                 let packet = buf[..n as usize].to_vec();
@@ -251,11 +268,15 @@ pub async fn run_tun_child(
                 Some(packet) => {
                     count += 1;
                     debug!("TUN: writing {} bytes (packet #{})", packet.len(), count);
-                    
-                    let written = unsafe { 
-                        libc::write(tun_write_fd, packet.as_ptr() as *const libc::c_void, packet.len())
+
+                    let written = unsafe {
+                        libc::write(
+                            tun_write_fd,
+                            packet.as_ptr() as *const libc::c_void,
+                            packet.len(),
+                        )
                     };
-                    
+
                     if written < 0 {
                         let err = std::io::Error::last_os_error();
                         error!("TUN: write error: {}", err);

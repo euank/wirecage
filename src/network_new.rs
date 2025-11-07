@@ -27,7 +27,6 @@ pub async fn run_wireguard_host(
         private_key,
         &args.wg_public_key,
         &args.wg_endpoint,
-        &args.wg_address,
     )
     .await?;
 

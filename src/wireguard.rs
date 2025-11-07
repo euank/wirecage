@@ -18,7 +18,6 @@ impl WireGuardTunnel {
         private_key: &str,
         public_key: &str,
         endpoint: &str,
-        _local_ip: &str,
     ) -> Result<Self> {
         // Decode keys
         let private_key_bytes = base64::engine::general_purpose::STANDARD

@@ -1,7 +1,437 @@
-// Placeholder for server binary
-// This matches the wirecagesrv from the cmd directory
+// WireGuard Server - userspace VPN server using boringtun
+// Routes client traffic to the internet with NAT
 
-fn main() {
-    eprintln!("wirecagesrv not yet implemented in Rust version");
-    std::process::exit(1);
+mod server_args;
+mod server_peer;
+
+use anyhow::{Context, Result};
+use base64::Engine;
+use boringtun::noise::{Tunn, TunnResult};
+use clap::Parser;
+use server_args::ServerArgs;
+use server_peer::Peer;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
+
+const MAX_PACKET: usize = 65536;
+
+pub struct WireGuardServer {
+    socket: Arc<UdpSocket>,
+    peers: Arc<Mutex<HashMap<[u8; 32], Peer>>>,
+    tun: Arc<Mutex<tun::AsyncDevice>>,
+}
+
+impl WireGuardServer {
+    pub async fn new(args: &ServerArgs) -> Result<Self> {
+        info!("Starting WireGuard server");
+
+        // Load server private key
+        let private_key = std::fs::read_to_string(&args.private_key_file)
+            .context("failed to read server private key")?
+            .trim()
+            .to_string();
+
+        let private_key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(private_key.trim())
+            .context("invalid private key encoding")?;
+
+        if private_key_bytes.len() != 32 {
+            anyhow::bail!("private key must be 32 bytes");
+        }
+
+        let mut server_priv_key = [0u8; 32];
+        server_priv_key.copy_from_slice(&private_key_bytes);
+
+        // Create UDP socket
+        let socket = UdpSocket::bind(&args.listen_addr)
+            .await
+            .context("failed to bind UDP socket")?;
+
+        info!("WireGuard server listening on {}", socket.local_addr()?);
+
+        // Set up peers
+        let mut peers = HashMap::new();
+        for peer_cfg in &args.peers {
+            let pub_key_bytes = base64::engine::general_purpose::STANDARD
+                .decode(peer_cfg.public_key.trim())
+                .context("invalid peer public key")?;
+
+            if pub_key_bytes.len() != 32 {
+                anyhow::bail!("peer public key must be 32 bytes");
+            }
+
+            let mut peer_pub_key = [0u8; 32];
+            peer_pub_key.copy_from_slice(&pub_key_bytes);
+
+            // Create tunnel for this peer
+            let tunnel = Tunn::new(
+                server_priv_key.into(),
+                peer_pub_key.into(),
+                None,
+                None,
+                0,
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to create tunnel: {}", e))?;
+
+            let peer = Peer::new(tunnel, peer_cfg.allowed_ips.clone());
+            
+            info!(
+                "Added peer with public key {} (allowed IPs: {:?})",
+                peer_cfg.public_key, peer_cfg.allowed_ips
+            );
+
+            peers.insert(peer_pub_key, peer);
+        }
+
+        // Create TUN interface
+        let tun_device = Self::create_tun(&args.tun_name, &args.subnet)?;
+
+        Ok(Self {
+            socket: Arc::new(socket),
+            peers: Arc::new(Mutex::new(peers)),
+            tun: Arc::new(Mutex::new(tun_device)),
+        })
+    }
+
+    fn create_tun(name: &str, subnet: &str) -> Result<tun::AsyncDevice> {
+        use tun::Device;
+
+        info!("Creating TUN interface: {}", name);
+
+        // Parse subnet address (e.g., "10.200.100.1")
+        let addr: std::net::Ipv4Addr = subnet.parse().context("invalid subnet address")?;
+        let octets = addr.octets();
+
+        let mut config = tun::Configuration::default();
+        config
+            .name(name)
+            .address((octets[0], octets[1], octets[2], octets[3]))
+            .netmask((255, 255, 255, 0))
+            .up();
+
+        #[cfg(target_os = "linux")]
+        config.platform(|config| {
+            config.packet_information(false);
+        });
+
+        let dev = tun::create_as_async(&config).context("failed to create TUN device")?;
+
+        info!("TUN interface {} created with address {}", name, subnet);
+
+        Ok(dev)
+    }
+
+    pub async fn run(self: Arc<Self>) -> Result<()> {
+        info!("WireGuard server running");
+
+        // Spawn TUN read task
+        let self_clone = Arc::clone(&self);
+        tokio::spawn(async move {
+            if let Err(e) = self_clone.run_tun_to_network().await {
+                error!("TUN->Network task failed: {}", e);
+            }
+        });
+
+        // Run UDP receive task in main thread
+        self.run_network_to_tun().await
+    }
+
+    // Read from TUN, encrypt, send to appropriate peer
+    async fn run_tun_to_network(self: Arc<Self>) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; MAX_PACKET];
+
+        loop {
+            let mut tun = self.tun.lock().await;
+            let len = tun.read(&mut buf).await?;
+            drop(tun);
+
+            let packet = &buf[..len];
+
+            if packet.is_empty() {
+                continue;
+            }
+
+            // Determine destination IP from packet
+            if packet.len() < 20 {
+                debug!("Packet too short to parse");
+                continue;
+            }
+
+            let version = packet[0] >> 4;
+            let dest_ip = if version == 4 && packet.len() >= 20 {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    packet[16],
+                    packet[17],
+                    packet[18],
+                    packet[19],
+                ))
+            } else if version == 6 && packet.len() >= 40 {
+                // IPv6 destination is at bytes 24-39
+                let mut addr = [0u8; 16];
+                addr.copy_from_slice(&packet[24..40]);
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(addr))
+            } else {
+                debug!("Unknown IP version: {}", version);
+                continue;
+            };
+
+            debug!("TUN packet {} bytes to {}", len, dest_ip);
+
+            // Find peer responsible for this IP
+            let peers = self.peers.lock().await;
+            let mut found_peer = None;
+
+            for (pub_key, peer) in peers.iter() {
+                if peer.owns_ip(&dest_ip) {
+                    found_peer = Some((pub_key.clone(), peer.endpoint));
+                    break;
+                }
+            }
+            drop(peers);
+
+            if let Some((pub_key, endpoint_opt)) = found_peer {
+                if let Some(endpoint) = endpoint_opt {
+                    // Encrypt and send
+                    let mut encrypted_buf = vec![0u8; MAX_PACKET];
+                    
+                    let mut peers = self.peers.lock().await;
+                    if let Some(peer) = peers.get_mut(&pub_key) {
+                        match peer.tunnel.encapsulate(packet, &mut encrypted_buf) {
+                            TunnResult::WriteToNetwork(encrypted) => {
+                                debug!("Sending {} encrypted bytes to {}", encrypted.len(), endpoint);
+                                if let Err(e) = self.socket.send_to(encrypted, endpoint).await {
+                                    warn!("Failed to send to {}: {}", endpoint, e);
+                                }
+                            }
+                            TunnResult::Done => {
+                                debug!("Encapsulation returned Done");
+                            }
+                            TunnResult::Err(e) => {
+                                warn!("Encapsulation error: {:?}", e);
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    debug!("No endpoint known for peer");
+                }
+            } else {
+                debug!("No peer found for destination IP: {}", dest_ip);
+            }
+        }
+    }
+
+    // Receive from UDP, decrypt, write to TUN
+    async fn run_network_to_tun(self: Arc<Self>) -> Result<()> {
+        let mut buf = vec![0u8; MAX_PACKET];
+
+        loop {
+            let (len, addr) = self.socket.recv_from(&mut buf).await?;
+            let packet = &buf[..len];
+
+            debug!("Received {} bytes from {}", len, addr);
+
+            let self_clone = Arc::clone(&self);
+            let packet = packet.to_vec();
+
+            // Handle packet in separate task to avoid blocking
+            tokio::spawn(async move {
+                if let Err(e) = self_clone.handle_packet(&packet, addr).await {
+                    debug!("Error handling packet from {}: {}", addr, e);
+                }
+            });
+        }
+    }
+
+    async fn handle_packet(&self, packet: &[u8], addr: SocketAddr) -> Result<()> {
+        let mut peers = self.peers.lock().await;
+
+        // Try to decrypt with each peer
+        for (pub_key, peer) in peers.iter_mut() {
+            let mut dst = vec![0u8; MAX_PACKET];
+
+            match peer.tunnel.decapsulate(None, packet, &mut dst) {
+                TunnResult::Done => {
+                    debug!("Handshake processed for peer {:02x?}...", &pub_key[..4]);
+                    peer.endpoint = Some(addr);
+                }
+                TunnResult::Err(_) => {
+                    // This peer couldn't decrypt it, try next
+                    continue;
+                }
+                TunnResult::WriteToNetwork(response) => {
+                    debug!("Sending handshake response {} bytes to {}", response.len(), addr);
+                    peer.endpoint = Some(addr);
+                    drop(peers); // Release lock before async operation
+                    self.socket.send_to(response, addr).await?;
+                    return Ok(());
+                }
+                TunnResult::WriteToTunnelV4(decrypted, _) | TunnResult::WriteToTunnelV6(decrypted, _) => {
+                    debug!("Decrypted {} bytes from peer", decrypted.len());
+                    peer.endpoint = Some(addr);
+                    
+                    // Write to TUN
+                    drop(peers); // Release lock
+                    use tokio::io::AsyncWriteExt;
+                    let mut tun = self.tun.lock().await;
+                    if let Err(e) = tun.write_all(decrypted).await {
+                        warn!("Failed to write to TUN: {}", e);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        debug!("No peer could process packet from {}", addr);
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let args = ServerArgs::parse();
+
+    // Create and run server
+    let server = Arc::new(WireGuardServer::new(&args).await?);
+
+    // Set up IP forwarding and NAT
+    setup_ip_forwarding(&args)?;
+    setup_nat(&args)?;
+
+    // Set up cleanup handler
+    let args_clone = args.clone();
+    ctrlc::set_handler(move || {
+        info!("Received Ctrl+C, cleaning up...");
+        if let Err(e) = cleanup_nat(&args_clone) {
+            error!("Failed to cleanup NAT: {}", e);
+        }
+        std::process::exit(0);
+    })
+    .context("failed to set Ctrl+C handler")?;
+
+    server.run().await
+}
+
+fn setup_ip_forwarding(_args: &ServerArgs) -> Result<()> {
+    info!("Enabling IP forwarding");
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+        .context("failed to enable IP forwarding - are you running as root?")?;
+    Ok(())
+}
+
+fn setup_nat(args: &ServerArgs) -> Result<()> {
+    info!("Setting up NAT rules");
+
+    // Determine outbound interface
+    let outbound_iface = if let Some(ref iface) = args.outbound_interface {
+        iface.clone()
+    } else {
+        // Try to auto-detect default interface
+        get_default_interface()?
+    };
+
+    info!("Using outbound interface: {}", outbound_iface);
+
+    // Set up iptables rules
+    let subnet = &args.subnet_cidr;
+    let tun_name = &args.tun_name;
+
+    // MASQUERADE rule for NAT
+    std::process::Command::new("iptables")
+        .args([
+            "-t", "nat",
+            "-A", "POSTROUTING",
+            "-s", subnet,
+            "-o", &outbound_iface,
+            "-j", "MASQUERADE",
+        ])
+        .output()
+        .context("failed to add MASQUERADE rule")?;
+
+    // FORWARD rules
+    std::process::Command::new("iptables")
+        .args([
+            "-A", "FORWARD",
+            "-i", tun_name,
+            "-j", "ACCEPT",
+        ])
+        .output()
+        .context("failed to add FORWARD rule (in)")?;
+
+    std::process::Command::new("iptables")
+        .args([
+            "-A", "FORWARD",
+            "-o", tun_name,
+            "-j", "ACCEPT",
+        ])
+        .output()
+        .context("failed to add FORWARD rule (out)")?;
+
+    info!("NAT rules configured");
+    Ok(())
+}
+
+fn cleanup_nat(args: &ServerArgs) -> Result<()> {
+    info!("Cleaning up NAT rules");
+
+    let default_iface = get_default_interface().unwrap_or_else(|_| "eth0".to_string());
+    let outbound_iface = args.outbound_interface.as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or(&default_iface);
+
+    let subnet = &args.subnet_cidr;
+    let tun_name = &args.tun_name;
+
+    // Remove rules (ignore errors on cleanup)
+    let _ = std::process::Command::new("iptables")
+        .args([
+            "-t", "nat",
+            "-D", "POSTROUTING",
+            "-s", subnet,
+            "-o", outbound_iface,
+            "-j", "MASQUERADE",
+        ])
+        .output();
+
+    let _ = std::process::Command::new("iptables")
+        .args(["-D", "FORWARD", "-i", tun_name, "-j", "ACCEPT"])
+        .output();
+
+    let _ = std::process::Command::new("iptables")
+        .args(["-D", "FORWARD", "-o", tun_name, "-j", "ACCEPT"])
+        .output();
+
+    Ok(())
+}
+
+fn get_default_interface() -> Result<String> {
+    // Parse ip route to get default interface
+    let output = std::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .context("failed to run 'ip route'")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Parse line like: "default via 192.168.1.1 dev eth0 proto dhcp metric 100"
+    if let Some(iface) = stdout.split_whitespace()
+        .skip_while(|&w| w != "dev")
+        .nth(1) {
+        return Ok(iface.to_string());
+    }
+
+    anyhow::bail!("could not determine default interface")
 }

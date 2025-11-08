@@ -5,15 +5,7 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 pub struct OverlayGuard {
-    tmpdir: PathBuf,
-}
-
-impl Drop for OverlayGuard {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.tmpdir) {
-            tracing::warn!("failed to cleanup overlay tmpdir: {}", e);
-        }
-    }
+    _tmpdir: tempfile::TempDir,
 }
 
 pub fn setup_etc_overlay(gateway: &str) -> Result<OverlayGuard> {
@@ -28,10 +20,8 @@ pub fn setup_etc_overlay(gateway: &str) -> Result<OverlayGuard> {
         .tempdir()
         .context("failed to create temp directory")?;
 
-    let tmpdir_path = tmpdir.into_path();
-
-    let workdir = tmpdir_path.join("work");
-    let layerdir = tmpdir_path.join("layer");
+    let workdir = tmpdir.path().join("work");
+    let layerdir = tmpdir.path().join("layer");
 
     std::fs::create_dir_all(&workdir).context("failed to create work directory")?;
     std::fs::create_dir_all(&layerdir).context("failed to create layer directory")?;
@@ -75,7 +65,5 @@ pub fn setup_etc_overlay(gateway: &str) -> Result<OverlayGuard> {
     )
     .context("failed to mount overlay filesystem")?;
 
-    Ok(OverlayGuard {
-        tmpdir: tmpdir_path,
-    })
+    Ok(OverlayGuard { _tmpdir: tmpdir })
 }

@@ -29,6 +29,7 @@ bytes = "1.9"
 ipnet = "2.10"
 tempfile = "3.13"
 smoltcp = { version = "0.11", features = ["std", "async", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp"] }
+ctrlc = "3.4"
 
 [profile.release]
 lto = true

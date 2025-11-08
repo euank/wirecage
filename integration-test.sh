@@ -28,12 +28,15 @@ SERVER_VETH_IP="192.168.100.2"
 cleanup() {
     echo -e "${YELLOW}Cleaning up...${NC}"
     
+    # Kill wirecagesrv
+    if [ -f /tmp/wirecagesrv.pid ]; then
+        sudo kill $(cat /tmp/wirecagesrv.pid) 2>/dev/null || true
+        rm -f /tmp/wirecagesrv.pid
+    fi
+    
     # Kill background processes
     jobs -p | xargs -r kill 2>/dev/null || true
     wait 2>/dev/null || true
-    
-    # Remove WireGuard interface in server namespace
-    sudo ip netns exec "$SERVER_NS" wg-quick down wg-test 2>/dev/null || true
     
     # Delete network namespace
     sudo ip netns del "$SERVER_NS" 2>/dev/null || true
@@ -43,7 +46,7 @@ cleanup() {
     
     # Remove temporary files
     rm -f "$CLIENT_PRIVKEY_FILE" "$SERVER_PRIVKEY_FILE" "$SERVER_PUBKEY_FILE" "$CLIENT_PUBKEY_FILE"
-    rm -f /tmp/wg-test.conf
+    rm -f /tmp/wg-test.conf /tmp/wirecagesrv.log
     
     echo -e "${YELLOW}Cleanup complete${NC}"
 }
@@ -76,13 +79,13 @@ check_prerequisites() {
         exit 1
     fi
     
-    if ! command -v wg &> /dev/null; then
-        log_error "wg command not found. Install wireguard-tools"
+    if [ ! -f "./target/release/wirecagesrv" ]; then
+        log_error "wirecagesrv binary not found. Run: cargo build --release"
         exit 1
     fi
     
-    if ! command -v wg-quick &> /dev/null; then
-        log_error "wg-quick command not found. Install wireguard-tools"
+    if ! command -v wg &> /dev/null; then
+        log_error "wg command not found. Install wireguard-tools"
         exit 1
     fi
     
@@ -131,37 +134,39 @@ setup_server_namespace() {
     log_success "Server namespace created"
 }
 
-# Set up WireGuard server
+# Set up WireGuard server using wirecagesrv
 setup_wireguard_server() {
-    log_info "Setting up WireGuard server..."
+    log_info "Setting up WireGuard server (wirecagesrv)..."
     
-    local server_privkey=$(cat "$SERVER_PRIVKEY_FILE")
     local client_pubkey=$(cat "$CLIENT_PUBKEY_FILE")
     
-    # Create WireGuard config (wg setconf doesn't accept Address/DNS, only pure WireGuard config)
-    cat > /tmp/wg-test.conf <<EOF
-[Interface]
-ListenPort = $WG_SERVER_PORT
-PrivateKey = $server_privkey
-
-[Peer]
-PublicKey = $client_pubkey
-AllowedIPs = $WG_CLIENT_IP/32
-EOF
+    # Start wirecagesrv in the server namespace
+    sudo ip netns exec "$SERVER_NS" \
+        ./target/release/wirecagesrv \
+        --private-key-file "$SERVER_PRIVKEY_FILE" \
+        --listen-addr "$SERVER_VETH_IP:$WG_SERVER_PORT" \
+        --subnet "$WG_SERVER_IP" \
+        --subnet-cidr "10.200.100.0/24" \
+        --tun-name wg-srv \
+        --peer "$client_pubkey,$WG_CLIENT_IP/32" \
+        > /tmp/wirecagesrv.log 2>&1 &
     
-    # Set up WireGuard interface in server namespace
-    sudo ip netns exec "$SERVER_NS" ip link add dev wg-test type wireguard
-    sudo ip netns exec "$SERVER_NS" ip addr add "$WG_SERVER_IP/24" dev wg-test
-    sudo ip netns exec "$SERVER_NS" wg setconf wg-test /tmp/wg-test.conf
-    sudo ip netns exec "$SERVER_NS" ip link set wg-test up
+    echo $! > /tmp/wirecagesrv.pid
     
-    log_success "WireGuard server configured"
+    # Give server time to start
+    sleep 2
     
-    # Verify server is listening
-    echo "  WireGuard interface status:"
-    sudo ip netns exec "$SERVER_NS" wg show wg-test | sed 's/^/    /'
-    echo "  Listening sockets:"
-    sudo ip netns exec "$SERVER_NS" ss -ulpn | grep "$WG_SERVER_PORT" | sed 's/^/    /' || echo "    WARNING: No socket on port $WG_SERVER_PORT"
+    if ! kill -0 $(cat /tmp/wirecagesrv.pid) 2>/dev/null; then
+        log_error "wirecagesrv failed to start"
+        cat /tmp/wirecagesrv.log
+        return 1
+    fi
+    
+    log_success "WireGuard server started (PID: $(cat /tmp/wirecagesrv.pid))"
+    
+    # Verify server is running
+    echo "  Server log:"
+    head -10 /tmp/wirecagesrv.log | sed 's/^/    /'
 }
 
 # Start test HTTP server in server namespace

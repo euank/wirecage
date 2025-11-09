@@ -92,7 +92,7 @@ impl WireGuardServer {
         }
 
         // Create TUN interface
-        let tun_device = Self::create_tun(&args.tun_name, &args.subnet)?;
+        let tun_device = Self::create_tun(&args.tun_name, &args.subnet, &args.subnet_cidr)?;
         
         // Split TUN into read/write halves to avoid lock contention
         let (tun_read, tun_write) = tokio::io::split(tun_device);
@@ -106,7 +106,7 @@ impl WireGuardServer {
         Ok((server, tun_read))
     }
 
-    fn create_tun(name: &str, subnet: &str) -> Result<tun::AsyncDevice> {
+    fn create_tun(name: &str, subnet: &str, subnet_cidr: &str) -> Result<tun::AsyncDevice> {
         info!("Creating TUN interface: {}", name);
 
         // Parse subnet address (e.g., "10.200.100.1")
@@ -128,6 +128,21 @@ impl WireGuardServer {
         let dev = tun::create_as_async(&config).context("failed to create TUN device")?;
 
         info!("TUN interface {} created with address {}", name, subnet);
+
+        // Add route for the subnet through this TUN interface
+        info!("Adding route for {} via {}", subnet_cidr, name);
+        let output = std::process::Command::new("ip")
+            .args(["route", "add", subnet_cidr, "dev", name])
+            .output()
+            .context("failed to add route")?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Ignore "File exists" error (route already present)
+            if !stderr.contains("File exists") {
+                warn!("Failed to add route: {}", stderr);
+            }
+        }
 
         Ok(dev)
     }

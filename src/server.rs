@@ -31,8 +31,9 @@ impl WireGuardServer {
     ) -> Result<(Self, tokio::io::ReadHalf<tun::AsyncDevice>)> {
         info!("Starting WireGuard server");
 
-        // Load server private key
-        let private_key = std::fs::read_to_string(&args.private_key_file)
+        // Load server private key (async to avoid blocking runtime thread)
+        let private_key = tokio::fs::read_to_string(&args.private_key_file)
+            .await
             .context("failed to read server private key")?
             .trim()
             .to_string();
@@ -252,19 +253,14 @@ impl WireGuardServer {
 
         loop {
             let (len, addr) = self.socket.recv_from(&mut buf).await?;
-            let packet = &buf[..len];
 
             debug!("Received {} bytes from {}", len, addr);
 
-            let self_clone = Arc::clone(&self);
-            let packet = packet.to_vec();
-
-            // Handle packet in separate task to avoid blocking
-            tokio::spawn(async move {
-                if let Err(e) = self_clone.handle_packet(&packet, addr).await {
-                    debug!("Error handling packet from {}: {}", addr, e);
-                }
-            });
+            // Handle packet inline - decapsulation is fast, no need to spawn
+            // This avoids task explosion under load
+            if let Err(e) = self.handle_packet(&buf[..len], addr).await {
+                debug!("Error handling packet from {}: {}", addr, e);
+            }
         }
     }
 

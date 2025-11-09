@@ -95,8 +95,28 @@ impl WireGuardServer {
         // Create TUN interface
         let tun_device = Self::create_tun(&args.tun_name, &args.subnet, &args.subnet_cidr)?;
         
+        // Verify interface is up before splitting
+        info!("Verifying TUN interface state...");
+        let link_check = std::process::Command::new("ip")
+            .args(["link", "show", &args.tun_name])
+            .output()
+            .context("failed to check interface state")?;
+        info!("Interface state: {}", String::from_utf8_lossy(&link_check.stdout).trim());
+        
         // Split TUN into read/write halves to avoid lock contention
         let (tun_read, tun_write) = tokio::io::split(tun_device);
+        
+        // Re-verify route after split
+        info!("Re-verifying route after split...");
+        let route_check = std::process::Command::new("ip")
+            .args(["route", "show", &args.subnet_cidr])
+            .output()
+            .context("failed to verify route after split")?;
+        let routes = String::from_utf8_lossy(&route_check.stdout);
+        info!("Route after split: {}", routes.trim());
+        if routes.trim().is_empty() {
+            error!("Route disappeared after split!");
+        }
 
         let server = Self {
             socket: Arc::new(socket),
@@ -140,6 +160,22 @@ impl WireGuardServer {
         
         if output.status.success() {
             info!("✓ Route added: {} dev {}", subnet_cidr, name);
+            
+            // Verify the route was actually added
+            let verify = std::process::Command::new("ip")
+                .args(["route", "show", subnet_cidr])
+                .output()
+                .context("failed to verify route")?;
+            
+            let routes = String::from_utf8_lossy(&verify.stdout);
+            info!("Route verification for {}:", subnet_cidr);
+            info!("  {}", routes.trim());
+            
+            if !routes.contains(name) {
+                error!("Route was added but is not showing the correct device!");
+                error!("  Expected: dev {}", name);
+                error!("  Got: {}", routes.trim());
+            }
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -419,6 +455,38 @@ async fn main() -> Result<()> {
         .await
         .context("spawn_blocking failed")??;
 
+    // systemd-networkd often deletes routes on TUN interfaces it doesn't manage
+    // Add/re-add the route after NAT setup to ensure it sticks
+    info!("Ensuring route is present after NAT setup...");
+    let route_output = std::process::Command::new("ip")
+        .args(["route", "replace", &args.subnet_cidr, "dev", &args.tun_name])
+        .output()
+        .context("failed to add route after NAT setup")?;
+    
+    if !route_output.status.success() {
+        let stderr = String::from_utf8_lossy(&route_output.stderr);
+        error!("Failed to add route after NAT: {}", stderr);
+    }
+    
+    // Verify it's there
+    let route_check = std::process::Command::new("ip")
+        .args(["route", "show", &args.subnet_cidr])
+        .output()
+        .context("failed to verify route after NAT")?;
+    let routes = String::from_utf8_lossy(&route_check.stdout);
+    if routes.trim().is_empty() {
+        error!("Route still missing after re-add attempt!");
+        error!("systemd-networkd may be interfering. Consider:");
+        error!("  1. Create /etc/systemd/network/99-ignore-wg.network with:");
+        error!("     [Match]");
+        error!("     Name=wg-*");
+        error!("     [Link]");
+        error!("     Unmanaged=yes");
+        error!("  2. Or disable systemd-networkd: systemctl disable systemd-networkd");
+    } else {
+        info!("✓ Route confirmed: {}", routes.trim());
+    }
+
     // Set up cleanup handler
     let args_clone = args.clone();
     ctrlc::set_handler(move || {
@@ -453,11 +521,26 @@ fn setup_nat(args: &ServerArgs) -> Result<()> {
 
     info!("Using outbound interface: {}", outbound_iface);
 
+    // Helper to verify route is still present
+    let verify_route = || {
+        let output = std::process::Command::new("ip")
+            .args(["route", "show", &args.subnet_cidr])
+            .output()
+            .ok()?;
+        let routes = String::from_utf8_lossy(&output.stdout);
+        if routes.contains(&args.tun_name) {
+            Some(())
+        } else {
+            None
+        }
+    };
+
     // Set up iptables rules
     let subnet = &args.subnet_cidr;
     let tun_name = &args.tun_name;
 
     // MASQUERADE rule for NAT
+    info!("Adding MASQUERADE rule...");
     std::process::Command::new("iptables")
         .args([
             "-t", "nat",
@@ -468,8 +551,13 @@ fn setup_nat(args: &ServerArgs) -> Result<()> {
         ])
         .output()
         .context("failed to add MASQUERADE rule")?;
+    
+    if verify_route().is_none() {
+        warn!("Route disappeared after MASQUERADE rule!");
+    }
 
     // FORWARD rules
+    info!("Adding FORWARD rule (inbound)...");
     std::process::Command::new("iptables")
         .args([
             "-A", "FORWARD",
@@ -478,7 +566,12 @@ fn setup_nat(args: &ServerArgs) -> Result<()> {
         ])
         .output()
         .context("failed to add FORWARD rule (in)")?;
+    
+    if verify_route().is_none() {
+        warn!("Route disappeared after FORWARD (in) rule!");
+    }
 
+    info!("Adding FORWARD rule (outbound)...");
     std::process::Command::new("iptables")
         .args([
             "-A", "FORWARD",
@@ -487,6 +580,10 @@ fn setup_nat(args: &ServerArgs) -> Result<()> {
         ])
         .output()
         .context("failed to add FORWARD rule (out)")?;
+    
+    if verify_route().is_none() {
+        warn!("Route disappeared after FORWARD (out) rule!");
+    }
 
     info!("NAT rules configured");
     Ok(())

@@ -1,0 +1,5 @@
+# Ignore binaries but keep README
+wirecage
+wirecagesrv
+*.tar.gz
+SHA256SUMS

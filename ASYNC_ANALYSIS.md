@@ -167,15 +167,18 @@ tokio::task::spawn_blocking(|| setup_nat(&args))
 
 ## Recommendations
 
-### Immediate (do now):
-1. ✅ **Already done**: Fixed TUN lock contention
-2. ⚠️ **Do next**: Remove per-packet `tokio::spawn`
-3. ⚠️ **Do next**: Use `tokio::fs` for key loading
+### ✅ All Issues Fixed!
 
-### Short-term (if issues appear):
-1. Add bounded concurrency if inline handling causes latency
-2. Narrow peer lock scope in slow path
-3. Add metrics/logging to identify actual bottlenecks
+1. ✅ Fixed TUN lock contention (split read/write)
+2. ✅ Removed per-packet `tokio::spawn` (inline handling)
+3. ✅ Use `tokio::fs` for key loading
+4. ✅ Narrowed peer lock scope in slow path (lock per-peer)
+5. ✅ Wrapped blocking syscalls in `spawn_blocking`
+
+### Future considerations (only if needed):
+1. Add bounded concurrency if inline handling causes latency under extreme load
+2. Add metrics/logging to identify actual bottlenecks
+3. Consider per-peer `Mutex` if many peers cause contention
 
 ### Long-term (only if needed):
 1. Per-peer `Mutex` for high concurrency

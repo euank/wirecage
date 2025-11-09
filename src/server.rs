@@ -130,19 +130,26 @@ impl WireGuardServer {
 
         info!("TUN interface {} created with address {}", name, subnet);
 
-        // Add route for the subnet through this TUN interface
+        // Add/replace route for the subnet through this TUN interface
+        // Use 'replace' instead of 'add' to handle existing routes
         info!("Adding route for {} via {}", subnet_cidr, name);
         let output = std::process::Command::new("ip")
-            .args(["route", "add", subnet_cidr, "dev", name])
+            .args(["route", "replace", subnet_cidr, "dev", name])
             .output()
-            .context("failed to add route")?;
+            .context("failed to execute 'ip route replace' command")?;
         
-        if !output.status.success() {
+        if output.status.success() {
+            info!("✓ Route added: {} dev {}", subnet_cidr, name);
+        } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore "File exists" error (route already present)
-            if !stderr.contains("File exists") {
-                warn!("Failed to add route: {}", stderr);
-            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            
+            // Log any errors
+            error!("Failed to set route: {} dev {}", subnet_cidr, name);
+            error!("  Exit code: {:?}", output.status.code());
+            error!("  Stderr: {}", stderr.trim());
+            error!("  Stdout: {}", stdout.trim());
+            anyhow::bail!("Failed to set route for TUN interface");
         }
 
         Ok(dev)

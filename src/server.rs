@@ -107,8 +107,6 @@ impl WireGuardServer {
     }
 
     fn create_tun(name: &str, subnet: &str) -> Result<tun::AsyncDevice> {
-        use tun::Device;
-
         info!("Creating TUN interface: {}", name);
 
         // Parse subnet address (e.g., "10.200.100.1")
@@ -308,33 +306,55 @@ impl WireGuardServer {
         }
 
         // Slow path: try all peers
-        let mut peers = self.peers.lock().await;
-        for (pub_key, peer) in peers.iter_mut() {
-            match peer.tunnel.decapsulate(None, packet, &mut dst) {
-                TunnResult::Done => {
+        // Get peer keys first (short lock), then lock per-peer during crypto
+        // This reduces lock contention compared to holding the global lock
+        let peer_keys: Vec<[u8; 32]> = {
+            let peers = self.peers.lock().await;
+            peers.keys().copied().collect()
+        };
+
+        for pub_key in peer_keys {
+            // Lock only this peer during decapsulation
+            let result = {
+                let mut peers = self.peers.lock().await;
+                if let Some(peer) = peers.get_mut(&pub_key) {
+                    let res = peer.tunnel.decapsulate(None, packet, &mut dst);
+                    // Update endpoint if successful
+                    match &res {
+                        TunnResult::Done | TunnResult::WriteToNetwork(_) 
+                        | TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+                            peer.endpoint = Some(addr);
+                        }
+                        _ => {}
+                    }
+                    Some(res)
+                } else {
+                    None
+                }
+            }; // Lock released here
+
+            // Handle result outside lock
+            match result {
+                Some(TunnResult::Done) => {
                     debug!("Handshake processed for peer {:02x?}...", &pub_key[..4]);
-                    peer.endpoint = Some(addr);
+                    return Ok(());
                 }
-                TunnResult::Err(_) => {
-                    // This peer couldn't decrypt it, try next
-                    continue;
-                }
-                TunnResult::WriteToNetwork(response) => {
+                Some(TunnResult::WriteToNetwork(response)) => {
                     debug!("Sending handshake response {} bytes to {}", response.len(), addr);
-                    peer.endpoint = Some(addr);
-                    drop(peers);
                     self.socket.send_to(response, addr).await?;
                     return Ok(());
                 }
-                TunnResult::WriteToTunnelV4(decrypted, _) | TunnResult::WriteToTunnelV6(decrypted, _) => {
+                Some(TunnResult::WriteToTunnelV4(decrypted, _)) | Some(TunnResult::WriteToTunnelV6(decrypted, _)) => {
                     debug!("Decrypted {} bytes from peer", decrypted.len());
-                    peer.endpoint = Some(addr);
-                    drop(peers);
                     
                     use tokio::io::AsyncWriteExt;
                     let mut tun = self.tun_write.lock().await;
                     tun.write_all(decrypted).await?;
                     return Ok(());
+                }
+                Some(TunnResult::Err(_)) | None => {
+                    // This peer couldn't decrypt it, try next
+                    continue;
                 }
             }
         }
@@ -359,9 +379,16 @@ async fn main() -> Result<()> {
     let (server, tun_read) = WireGuardServer::new(&args).await?;
     let server = Arc::new(server);
 
-    // Set up IP forwarding and NAT
-    setup_ip_forwarding(&args)?;
-    setup_nat(&args)?;
+    // Set up IP forwarding and NAT (blocking syscalls, run in blocking thread)
+    let args_clone = args.clone();
+    tokio::task::spawn_blocking(move || setup_ip_forwarding(&args_clone))
+        .await
+        .context("spawn_blocking failed")??;
+    
+    let args_clone = args.clone();
+    tokio::task::spawn_blocking(move || setup_nat(&args_clone))
+        .await
+        .context("spawn_blocking failed")??;
 
     // Set up cleanup handler
     let args_clone = args.clone();
@@ -471,6 +498,7 @@ fn cleanup_nat(args: &ServerArgs) -> Result<()> {
 
 fn get_default_interface() -> Result<String> {
     // Parse ip route to get default interface
+    // Note: This function may be called from spawn_blocking context
     let output = std::process::Command::new("ip")
         .args(["route", "show", "default"])
         .output()

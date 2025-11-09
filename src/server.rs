@@ -87,6 +87,7 @@ impl WireGuardServer {
                 "Added peer with public key {} (allowed IPs: {:?})",
                 peer_cfg.public_key, peer_cfg.allowed_ips
             );
+            debug!("Peer allowed_ips stored as: {:?}", peer.allowed_ips);
 
             peers.insert(peer_pub_key, peer);
         }
@@ -211,7 +212,9 @@ impl WireGuardServer {
                 let peers = self.peers.lock().await;
                 let mut result = None;
                 for (pub_key, peer) in peers.iter() {
+                    debug!("Checking if peer owns IP {}: allowed_ips={:?}", dest_ip, peer.allowed_ips);
                     if peer.owns_ip(&dest_ip) {
+                        debug!("Peer {:02x?}... owns {}", &pub_key[..4], dest_ip);
                         result = Some((*pub_key, peer.endpoint));
                         break;
                     }
@@ -384,7 +387,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("info")
+                        // Suppress noisy boringtun timer warnings
+                        .add_directive("boringtun::noise::timers=error".parse().unwrap())
+                }),
         )
         .init();
 

@@ -22,11 +22,13 @@ const MAX_PACKET: usize = 65536;
 pub struct WireGuardServer {
     socket: Arc<UdpSocket>,
     peers: Arc<Mutex<HashMap<[u8; 32], Peer>>>,
-    tun: Arc<Mutex<tun::AsyncDevice>>,
+    tun_write: Arc<Mutex<tokio::io::WriteHalf<tun::AsyncDevice>>>,
 }
 
 impl WireGuardServer {
-    pub async fn new(args: &ServerArgs) -> Result<Self> {
+    pub async fn new(
+        args: &ServerArgs,
+    ) -> Result<(Self, tokio::io::ReadHalf<tun::AsyncDevice>)> {
         info!("Starting WireGuard server");
 
         // Load server private key
@@ -90,12 +92,17 @@ impl WireGuardServer {
 
         // Create TUN interface
         let tun_device = Self::create_tun(&args.tun_name, &args.subnet)?;
+        
+        // Split TUN into read/write halves to avoid lock contention
+        let (tun_read, tun_write) = tokio::io::split(tun_device);
 
-        Ok(Self {
+        let server = Self {
             socket: Arc::new(socket),
             peers: Arc::new(Mutex::new(peers)),
-            tun: Arc::new(Mutex::new(tun_device)),
-        })
+            tun_write: Arc::new(Mutex::new(tun_write)),
+        };
+
+        Ok((server, tun_read))
     }
 
     fn create_tun(name: &str, subnet: &str) -> Result<tun::AsyncDevice> {
@@ -126,13 +133,13 @@ impl WireGuardServer {
         Ok(dev)
     }
 
-    pub async fn run(self: Arc<Self>) -> Result<()> {
+    pub async fn run(self: Arc<Self>, tun_read: tokio::io::ReadHalf<tun::AsyncDevice>) -> Result<()> {
         info!("WireGuard server running");
 
-        // Spawn TUN read task
+        // Spawn TUN read task with read half
         let self_clone = Arc::clone(&self);
         tokio::spawn(async move {
-            if let Err(e) = self_clone.run_tun_to_network().await {
+            if let Err(e) = self_clone.run_tun_to_network(tun_read).await {
                 error!("TUN->Network task failed: {}", e);
             }
         });
@@ -142,14 +149,16 @@ impl WireGuardServer {
     }
 
     // Read from TUN, encrypt, send to appropriate peer
-    async fn run_tun_to_network(self: Arc<Self>) -> Result<()> {
+    async fn run_tun_to_network(
+        self: Arc<Self>,
+        mut tun_read: tokio::io::ReadHalf<tun::AsyncDevice>,
+    ) -> Result<()> {
         use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; MAX_PACKET];
+        let mut encrypted_buf = vec![0u8; MAX_PACKET]; // Reuse buffer
 
         loop {
-            let mut tun = self.tun.lock().await;
-            let len = tun.read(&mut buf).await?;
-            drop(tun);
+            let len = tun_read.read(&mut buf).await?;
 
             let packet = &buf[..len];
 
@@ -183,46 +192,56 @@ impl WireGuardServer {
 
             debug!("TUN packet {} bytes to {}", len, dest_ip);
 
-            // Find peer responsible for this IP
-            let peers = self.peers.lock().await;
-            let mut found_peer = None;
-
-            for (pub_key, peer) in peers.iter() {
-                if peer.owns_ip(&dest_ip) {
-                    found_peer = Some((pub_key.clone(), peer.endpoint));
-                    break;
+            // Find peer responsible for this IP (quick lookup without holding lock)
+            let peer_info = {
+                let peers = self.peers.lock().await;
+                let mut result = None;
+                for (pub_key, peer) in peers.iter() {
+                    if peer.owns_ip(&dest_ip) {
+                        result = Some((*pub_key, peer.endpoint));
+                        break;
+                    }
                 }
-            }
-            drop(peers);
+                result
+            };
+            
+            let (peer_key, endpoint) = match peer_info {
+                Some((k, Some(e))) => (k, e),
+                _ => {
+                    debug!("No peer found for destination IP: {}", dest_ip);
+                    continue;
+                }
+            };
 
-            if let Some((pub_key, endpoint_opt)) = found_peer {
-                if let Some(endpoint) = endpoint_opt {
-                    // Encrypt and send
-                    let mut encrypted_buf = vec![0u8; MAX_PACKET];
-                    
+            {
+                // Encrypt packet (hold lock only during encryption, not during send)
+                let encrypted_len = {
                     let mut peers = self.peers.lock().await;
-                    if let Some(peer) = peers.get_mut(&pub_key) {
+                    if let Some(peer) = peers.get_mut(&peer_key) {
                         match peer.tunnel.encapsulate(packet, &mut encrypted_buf) {
-                            TunnResult::WriteToNetwork(encrypted) => {
-                                debug!("Sending {} encrypted bytes to {}", encrypted.len(), endpoint);
-                                if let Err(e) = self.socket.send_to(encrypted, endpoint).await {
-                                    warn!("Failed to send to {}: {}", endpoint, e);
-                                }
-                            }
+                            TunnResult::WriteToNetwork(encrypted) => encrypted.len(),
                             TunnResult::Done => {
                                 debug!("Encapsulation returned Done");
+                                0
                             }
                             TunnResult::Err(e) => {
                                 warn!("Encapsulation error: {:?}", e);
+                                0
                             }
-                            _ => {}
+                            _ => 0,
                         }
+                    } else {
+                        0
                     }
-                } else {
-                    debug!("No endpoint known for peer");
+                };
+
+                // Send without holding lock
+                if encrypted_len > 0 {
+                    debug!("Sending {} encrypted bytes to {}", encrypted_len, endpoint);
+                    if let Err(e) = self.socket.send_to(&encrypted_buf[..encrypted_len], endpoint).await {
+                        warn!("Failed to send to {}: {}", endpoint, e);
+                    }
                 }
-            } else {
-                debug!("No peer found for destination IP: {}", dest_ip);
             }
         }
     }
@@ -250,12 +269,51 @@ impl WireGuardServer {
     }
 
     async fn handle_packet(&self, packet: &[u8], addr: SocketAddr) -> Result<()> {
+        let mut dst = vec![0u8; MAX_PACKET];
+
+        // Fast path: try peer with matching endpoint first
+        let endpoint_key = {
+            let peers = self.peers.lock().await;
+            peers.iter()
+                .find_map(|(k, p)| if p.endpoint == Some(addr) { Some(*k) } else { None })
+        };
+
+        if let Some(key) = endpoint_key {
+            let mut peers = self.peers.lock().await;
+            if let Some(peer) = peers.get_mut(&key) {
+                match peer.tunnel.decapsulate(None, packet, &mut dst) {
+                    TunnResult::Done => {
+                        debug!("Handshake processed for peer (fast path)");
+                        peer.endpoint = Some(addr);
+                        return Ok(());
+                    }
+                    TunnResult::WriteToNetwork(response) => {
+                        debug!("Sending handshake response {} bytes (fast path)", response.len());
+                        peer.endpoint = Some(addr);
+                        drop(peers);
+                        self.socket.send_to(response, addr).await?;
+                        return Ok(());
+                    }
+                    TunnResult::WriteToTunnelV4(decrypted, _) | TunnResult::WriteToTunnelV6(decrypted, _) => {
+                        debug!("Decrypted {} bytes (fast path)", decrypted.len());
+                        peer.endpoint = Some(addr);
+                        drop(peers);
+                        
+                        use tokio::io::AsyncWriteExt;
+                        let mut tun = self.tun_write.lock().await;
+                        tun.write_all(decrypted).await?;
+                        return Ok(());
+                    }
+                    TunnResult::Err(_) => {
+                        // Fall through to full scan
+                    }
+                }
+            }
+        }
+
+        // Slow path: try all peers
         let mut peers = self.peers.lock().await;
-
-        // Try to decrypt with each peer
         for (pub_key, peer) in peers.iter_mut() {
-            let mut dst = vec![0u8; MAX_PACKET];
-
             match peer.tunnel.decapsulate(None, packet, &mut dst) {
                 TunnResult::Done => {
                     debug!("Handshake processed for peer {:02x?}...", &pub_key[..4]);
@@ -268,21 +326,18 @@ impl WireGuardServer {
                 TunnResult::WriteToNetwork(response) => {
                     debug!("Sending handshake response {} bytes to {}", response.len(), addr);
                     peer.endpoint = Some(addr);
-                    drop(peers); // Release lock before async operation
+                    drop(peers);
                     self.socket.send_to(response, addr).await?;
                     return Ok(());
                 }
                 TunnResult::WriteToTunnelV4(decrypted, _) | TunnResult::WriteToTunnelV6(decrypted, _) => {
                     debug!("Decrypted {} bytes from peer", decrypted.len());
                     peer.endpoint = Some(addr);
+                    drop(peers);
                     
-                    // Write to TUN
-                    drop(peers); // Release lock
                     use tokio::io::AsyncWriteExt;
-                    let mut tun = self.tun.lock().await;
-                    if let Err(e) = tun.write_all(decrypted).await {
-                        warn!("Failed to write to TUN: {}", e);
-                    }
+                    let mut tun = self.tun_write.lock().await;
+                    tun.write_all(decrypted).await?;
                     return Ok(());
                 }
             }
@@ -304,8 +359,9 @@ async fn main() -> Result<()> {
 
     let args = ServerArgs::parse();
 
-    // Create and run server
-    let server = Arc::new(WireGuardServer::new(&args).await?);
+    // Create server
+    let (server, tun_read) = WireGuardServer::new(&args).await?;
+    let server = Arc::new(server);
 
     // Set up IP forwarding and NAT
     setup_ip_forwarding(&args)?;
@@ -322,7 +378,7 @@ async fn main() -> Result<()> {
     })
     .context("failed to set Ctrl+C handler")?;
 
-    server.run().await
+    server.run(tun_read).await
 }
 
 fn setup_ip_forwarding(_args: &ServerArgs) -> Result<()> {

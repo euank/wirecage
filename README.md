@@ -64,9 +64,11 @@ What this does is disable a [recent kernel feature that restricts unpriveleged u
 
 ## How it works
 
-It uses the [wireguard-go](https://pkg.go.dev/golang.zx2c4.com/wireguard/tun/netstack) netstack package in combination with unprivileged network namespaces.
+[boringtun](https://github.com/cloudflare/boringtun) for userspace wireguard, a network namespace to contain the process, and [smoltcp](https://github.com/smoltcp-rs/smoltcp) for the network stack itself.
 
-The majority of this code is based on the [httptap](https://github.com/monasticacademy/httptap) code, used under the terms of the MIT license.
+Note: this project was created with LLM assistance. A human has reviewed all the code and verified it's not too wild.
+
+Per the license, there is no warranty.
 
 ## Caveats
 

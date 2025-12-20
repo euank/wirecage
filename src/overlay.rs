@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tracing::debug;
 
 pub struct OverlayGuard {

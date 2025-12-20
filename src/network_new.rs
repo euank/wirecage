@@ -1,7 +1,9 @@
 use anyhow::Result;
+use gotatun::packet::Packet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
+use zerocopy::IntoBytes;
 
 use crate::args::Args;
 use crate::wireguard::WireGuardTunnel;
@@ -41,24 +43,25 @@ pub async fn run_wireguard_host(
     let mut tun_to_wg_rx = tun_to_wg_rx;
     tokio::spawn(async move {
         debug!("TUN->WG forwarder started (host namespace)");
-        while let Some(packet) = tun_to_wg_rx.recv().await {
-            debug!("TUN->WG: received {} bytes from channel", packet.len());
+        while let Some(packet_bytes) = tun_to_wg_rx.recv().await {
+            debug!("TUN->WG: received {} bytes from channel", packet_bytes.len());
 
             // Retry encapsulation if handshake is in progress
             let mut retries = 0;
             loop {
                 let mut tunnel = wg_tunnel_tx.lock().await;
-                let mut out_buf = vec![0u8; packet.len() + 148];
-
-                match tunnel.encapsulate(&packet, &mut out_buf) {
-                    boringtun::noise::TunnResult::WriteToNetwork(data) => {
+                let packet = Packet::from_bytes(bytes::BytesMut::from(packet_bytes.as_slice()));
+                match tunnel.handle_outgoing_packet(packet) {
+                    Some(wg_kind) => {
+                        let wg_packet: Packet = wg_kind.into();
+                        let data = wg_packet.as_bytes();
                         debug!("TUN->WG: sending {} bytes to WireGuard", data.len());
                         if let Err(e) = wg_socket_tx.send_to(data, wg_endpoint).await {
                             error!("TUN->WG: send error: {}", e);
                         }
                         break; // Success, move to next packet
                     }
-                    boringtun::noise::TunnResult::Done => {
+                    None => {
                         debug!("TUN->WG: handshake in progress (retry {})", retries);
                         retries += 1;
                         if retries > 20 {
@@ -68,13 +71,6 @@ pub async fn run_wireguard_host(
                         drop(tunnel); // Release lock before sleeping
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         // Retry
-                    }
-                    boringtun::noise::TunnResult::Err(e) => {
-                        error!("TUN->WG: encapsulation error: {:?}", e);
-                        break;
-                    }
-                    _ => {
-                        break;
                     }
                 }
             }
@@ -90,7 +86,6 @@ pub async fn run_wireguard_host(
             local_addr
         );
         let mut recv_buf = vec![0u8; 2048];
-        let mut decap_buf = vec![0u8; 2048];
         let mut counter = 0u32;
 
         loop {
@@ -106,21 +101,31 @@ pub async fn run_wireguard_host(
                     debug!("WG->TUN: received {} bytes from {}", n, addr);
 
                     let mut tunnel = wg_tunnel_rx.lock().await;
-                    match tunnel.decapsulate(None, &recv_buf[..n], &mut decap_buf) {
-                        boringtun::noise::TunnResult::WriteToTunnelV4(data, _)
-                        | boringtun::noise::TunnResult::WriteToTunnelV6(data, _) => {
+                    let packet = Packet::from_bytes(bytes::BytesMut::from(&recv_buf[..n]));
+                    let wg_packet = match packet.try_into_wg() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!("WG->TUN: failed to parse WG packet: {}", e);
+                            continue;
+                        }
+                    };
+                    match tunnel.handle_incoming_packet(wg_packet) {
+                        gotatun::noise::TunnResult::WriteToTunnel(data) => {
+                            let data_bytes = data.as_bytes();
                             debug!(
                                 "WG->TUN: decapsulated {} bytes IP packet, sending to channel",
-                                data.len()
+                                data_bytes.len()
                             );
-                            if let Err(e) = wg_to_tun_tx.send(data.to_vec()).await {
+                            if let Err(e) = wg_to_tun_tx.send(data_bytes.to_vec()).await {
                                 error!("WG->TUN: channel send error: {}", e);
                                 break;
                             } else {
                                 debug!("WG->TUN: sent to channel successfully");
                             }
                         }
-                        boringtun::noise::TunnResult::WriteToNetwork(data) => {
+                        gotatun::noise::TunnResult::WriteToNetwork(wg_kind) => {
+                            let wg_packet: Packet = wg_kind.into();
+                            let data = wg_packet.as_bytes();
                             debug!(
                                 "WG->TUN: got WireGuard protocol message, sending back {} bytes",
                                 data.len()
@@ -129,7 +134,7 @@ pub async fn run_wireguard_host(
                                 error!("WG->TUN: failed to send protocol message: {}", e);
                             }
                         }
-                        boringtun::noise::TunnResult::Err(e) => {
+                        gotatun::noise::TunnResult::Err(e) => {
                             error!("WG->TUN: decapsulation error: {:?}", e);
                         }
                         result => {
@@ -162,15 +167,18 @@ pub async fn run_wireguard_host(
             debug!("Timer: tick");
 
             let mut tunnel = wg_tunnel_timer.lock().await;
-            let mut out_buf = vec![0u8; 148];
 
-            match tunnel.update_timers(&mut out_buf) {
-                boringtun::noise::TunnResult::WriteToNetwork(data) => {
+            match tunnel.update_timers() {
+                Ok(Some(wg_kind)) => {
+                    let wg_packet: Packet = wg_kind.into();
+                    let data = wg_packet.as_bytes();
                     debug!("Timer: sending {} bytes", data.len());
                     let _ = wg_socket_timer.send_to(data, wg_endpoint_timer).await;
                 }
-                boringtun::noise::TunnResult::Done => {}
-                _ => {}
+                Ok(None) => {}
+                Err(e) => {
+                    error!("Timer: update_timers error: {:?}", e);
+                }
             }
         }
     });

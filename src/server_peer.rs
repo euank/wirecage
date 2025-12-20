@@ -1,4 +1,4 @@
-use boringtun::noise::Tunn;
+use gotatun::noise::Tunn;
 use std::net::{IpAddr, SocketAddr};
 
 pub struct Peer {

@@ -20,7 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nix = { version = "0.29", features = ["user", "mount", "sched", "process", "net"] }
 libc = "0.2"
 base64 = "0.22"
-boringtun = "0.6"
+gotatun = "0.1"
 tun = { version = "0.6", features = ["async"] }
 rtnetlink = "0.14"
 netlink-packet-route = "0.20"
@@ -30,6 +30,7 @@ ipnet = "2.10"
 tempfile = "3.13"
 smoltcp = { version = "0.11", features = ["std", "async", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp"] }
 ctrlc = "3.4"
+zerocopy = "0.8.31"
 
 [profile.release]
 lto = true

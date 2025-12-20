@@ -1,4 +1,4 @@
-// WireGuard Server - userspace VPN server using boringtun
+// WireGuard Server - userspace VPN server using gotatun
 // Routes client traffic to the internet with NAT
 
 mod server_args;
@@ -6,7 +6,8 @@ mod server_peer;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use boringtun::noise::{Tunn, TunnResult};
+use gotatun::noise::{Tunn, TunnResult};
+use gotatun::packet::Packet;
 use clap::Parser;
 use server_args::ServerArgs;
 use server_peer::Peer;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+use zerocopy::IntoBytes;
 
 const MAX_PACKET: usize = 65536;
 
@@ -78,11 +80,10 @@ impl WireGuardServer {
                 None,
                 0,
                 None,
-            )
-            .map_err(|e| anyhow::anyhow!("failed to create tunnel: {}", e))?;
+            );
 
             let peer = Peer::new(tunnel, peer_cfg.allowed_ips.clone());
-            
+
             info!(
                 "Added peer with public key {} (allowed IPs: {:?})",
                 peer_cfg.public_key, peer_cfg.allowed_ips
@@ -94,7 +95,7 @@ impl WireGuardServer {
 
         // Create TUN interface
         let tun_device = Self::create_tun(&args.tun_name, &args.subnet, &args.subnet_cidr)?;
-        
+
         // Verify interface is up before splitting
         info!("Verifying TUN interface state...");
         let link_check = std::process::Command::new("ip")
@@ -102,10 +103,10 @@ impl WireGuardServer {
             .output()
             .context("failed to check interface state")?;
         info!("Interface state: {}", String::from_utf8_lossy(&link_check.stdout).trim());
-        
+
         // Split TUN into read/write halves to avoid lock contention
         let (tun_read, tun_write) = tokio::io::split(tun_device);
-        
+
         // Re-verify route after split
         info!("Re-verifying route after split...");
         let route_check = std::process::Command::new("ip")
@@ -157,20 +158,20 @@ impl WireGuardServer {
             .args(["route", "replace", subnet_cidr, "dev", name])
             .output()
             .context("failed to execute 'ip route replace' command")?;
-        
+
         if output.status.success() {
             info!("✓ Route added: {} dev {}", subnet_cidr, name);
-            
+
             // Verify the route was actually added
             let verify = std::process::Command::new("ip")
                 .args(["route", "show", subnet_cidr])
                 .output()
                 .context("failed to verify route")?;
-            
+
             let routes = String::from_utf8_lossy(&verify.stdout);
             info!("Route verification for {}:", subnet_cidr);
             info!("  {}", routes.trim());
-            
+
             if !routes.contains(name) {
                 error!("Route was added but is not showing the correct device!");
                 error!("  Expected: dev {}", name);
@@ -179,7 +180,7 @@ impl WireGuardServer {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            
+
             // Log any errors
             error!("Failed to set route: {} dev {}", subnet_cidr, name);
             error!("  Exit code: {:?}", output.status.code());
@@ -213,7 +214,6 @@ impl WireGuardServer {
     ) -> Result<()> {
         use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; MAX_PACKET];
-        let mut encrypted_buf = vec![0u8; MAX_PACKET]; // Reuse buffer
 
         loop {
             let len = tun_read.read(&mut buf).await?;
@@ -264,7 +264,7 @@ impl WireGuardServer {
                 }
                 result
             };
-            
+
             let (peer_key, endpoint) = match peer_info {
                 Some((k, Some(e))) => (k, e),
                 _ => {
@@ -275,30 +275,29 @@ impl WireGuardServer {
 
             {
                 // Encrypt packet (hold lock only during encryption, not during send)
-                let encrypted_len = {
+                let encrypted_data: Option<Vec<u8>> = {
                     let mut peers = self.peers.lock().await;
                     if let Some(peer) = peers.get_mut(&peer_key) {
-                        match peer.tunnel.encapsulate(packet, &mut encrypted_buf) {
-                            TunnResult::WriteToNetwork(encrypted) => encrypted.len(),
-                            TunnResult::Done => {
-                                debug!("Encapsulation returned Done");
-                                0
+                        let ip_packet = Packet::from_bytes(bytes::BytesMut::from(packet));
+                        match peer.tunnel.handle_outgoing_packet(ip_packet) {
+                            Some(wg_kind) => {
+                                let wg_packet: Packet = wg_kind.into();
+                                Some(wg_packet.as_bytes().to_vec())
                             }
-                            TunnResult::Err(e) => {
-                                warn!("Encapsulation error: {:?}", e);
-                                0
+                            None => {
+                                debug!("Encapsulation returned None (handshake in progress)");
+                                None
                             }
-                            _ => 0,
                         }
                     } else {
-                        0
+                        None
                     }
                 };
 
                 // Send without holding lock
-                if encrypted_len > 0 {
-                    debug!("Sending {} encrypted bytes to {}", encrypted_len, endpoint);
-                    if let Err(e) = self.socket.send_to(&encrypted_buf[..encrypted_len], endpoint).await {
+                if let Some(data) = encrypted_data {
+                    debug!("Sending {} encrypted bytes to {}", data.len(), endpoint);
+                    if let Err(e) = self.socket.send_to(&data, endpoint).await {
                         warn!("Failed to send to {}: {}", endpoint, e);
                     }
                 }
@@ -324,8 +323,6 @@ impl WireGuardServer {
     }
 
     async fn handle_packet(&self, packet: &[u8], addr: SocketAddr) -> Result<()> {
-        let mut dst = vec![0u8; MAX_PACKET];
-
         // Fast path: try peer with matching endpoint first
         let endpoint_key = {
             let peers = self.peers.lock().await;
@@ -334,29 +331,43 @@ impl WireGuardServer {
         };
 
         if let Some(key) = endpoint_key {
+            let wg_packet = Packet::from_bytes(bytes::BytesMut::from(packet));
+            let wg_kind = match wg_packet.try_into_wg() {
+                Ok(k) => k,
+                Err(e) => {
+                    debug!("Failed to parse WG packet: {}", e);
+                    return Ok(());
+                }
+            };
+
             let mut peers = self.peers.lock().await;
             if let Some(peer) = peers.get_mut(&key) {
-                match peer.tunnel.decapsulate(None, packet, &mut dst) {
+                match peer.tunnel.handle_incoming_packet(wg_kind) {
                     TunnResult::Done => {
                         debug!("Handshake processed for peer (fast path)");
                         peer.endpoint = Some(addr);
                         return Ok(());
                     }
                     TunnResult::WriteToNetwork(response) => {
-                        debug!("Sending handshake response {} bytes (fast path)", response.len());
+                        let response_packet: Packet = response.into();
+                        let response_bytes = response_packet.as_bytes();
+                        debug!("Sending handshake response {} bytes (fast path)", response_bytes.len());
                         peer.endpoint = Some(addr);
+                        let response_vec = response_bytes.to_vec();
                         drop(peers);
-                        self.socket.send_to(response, addr).await?;
+                        self.socket.send_to(&response_vec, addr).await?;
                         return Ok(());
                     }
-                    TunnResult::WriteToTunnelV4(decrypted, _) | TunnResult::WriteToTunnelV6(decrypted, _) => {
-                        debug!("Decrypted {} bytes (fast path)", decrypted.len());
+                    TunnResult::WriteToTunnel(decrypted) => {
+                        let decrypted_bytes = decrypted.as_bytes();
+                        debug!("Decrypted {} bytes (fast path)", decrypted_bytes.len());
                         peer.endpoint = Some(addr);
+                        let decrypted_vec = decrypted_bytes.to_vec();
                         drop(peers);
-                        
+
                         use tokio::io::AsyncWriteExt;
                         let mut tun = self.tun_write.lock().await;
-                        tun.write_all(decrypted).await?;
+                        tun.write_all(&decrypted_vec).await?;
                         return Ok(());
                     }
                     TunnResult::Err(_) => {
@@ -375,15 +386,24 @@ impl WireGuardServer {
         };
 
         for pub_key in peer_keys {
+            let wg_packet = Packet::from_bytes(bytes::BytesMut::from(packet));
+            let wg_kind = match wg_packet.try_into_wg() {
+                Ok(k) => k,
+                Err(e) => {
+                    debug!("Failed to parse WG packet: {}", e);
+                    return Ok(());
+                }
+            };
+
             // Lock only this peer during decapsulation
             let result = {
                 let mut peers = self.peers.lock().await;
                 if let Some(peer) = peers.get_mut(&pub_key) {
-                    let res = peer.tunnel.decapsulate(None, packet, &mut dst);
+                    let res = peer.tunnel.handle_incoming_packet(wg_kind);
                     // Update endpoint if successful
                     match &res {
-                        TunnResult::Done | TunnResult::WriteToNetwork(_) 
-                        | TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+                        TunnResult::Done | TunnResult::WriteToNetwork(_)
+                        | TunnResult::WriteToTunnel(_) => {
                             peer.endpoint = Some(addr);
                         }
                         _ => {}
@@ -401,16 +421,19 @@ impl WireGuardServer {
                     return Ok(());
                 }
                 Some(TunnResult::WriteToNetwork(response)) => {
-                    debug!("Sending handshake response {} bytes to {}", response.len(), addr);
-                    self.socket.send_to(response, addr).await?;
+                    let response_packet: Packet = response.into();
+                    let response_bytes = response_packet.as_bytes();
+                    debug!("Sending handshake response {} bytes to {}", response_bytes.len(), addr);
+                    self.socket.send_to(response_bytes, addr).await?;
                     return Ok(());
                 }
-                Some(TunnResult::WriteToTunnelV4(decrypted, _)) | Some(TunnResult::WriteToTunnelV6(decrypted, _)) => {
-                    debug!("Decrypted {} bytes from peer", decrypted.len());
-                    
+                Some(TunnResult::WriteToTunnel(decrypted)) => {
+                    let decrypted_bytes = decrypted.as_bytes();
+                    debug!("Decrypted {} bytes from peer", decrypted_bytes.len());
+
                     use tokio::io::AsyncWriteExt;
                     let mut tun = self.tun_write.lock().await;
-                    tun.write_all(decrypted).await?;
+                    tun.write_all(decrypted_bytes).await?;
                     return Ok(());
                 }
                 Some(TunnResult::Err(_)) | None => {
@@ -432,8 +455,8 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| {
                     tracing_subscriber::EnvFilter::new("info")
-                        // Suppress noisy boringtun timer warnings
-                        .add_directive("boringtun::noise::timers=error".parse().unwrap())
+                        // Suppress noisy gotatun timer warnings
+                        .add_directive("gotatun::noise::timers=error".parse().unwrap())
                 }),
         )
         .init();
@@ -449,7 +472,7 @@ async fn main() -> Result<()> {
     tokio::task::spawn_blocking(move || setup_ip_forwarding(&args_clone))
         .await
         .context("spawn_blocking failed")??;
-    
+
     let args_clone = args.clone();
     tokio::task::spawn_blocking(move || setup_nat(&args_clone))
         .await
@@ -462,12 +485,12 @@ async fn main() -> Result<()> {
         .args(["route", "replace", &args.subnet_cidr, "dev", &args.tun_name])
         .output()
         .context("failed to add route after NAT setup")?;
-    
+
     if !route_output.status.success() {
         let stderr = String::from_utf8_lossy(&route_output.stderr);
         error!("Failed to add route after NAT: {}", stderr);
     }
-    
+
     // Verify it's there
     let route_check = std::process::Command::new("ip")
         .args(["route", "show", &args.subnet_cidr])
@@ -551,7 +574,7 @@ fn setup_nat(args: &ServerArgs) -> Result<()> {
         ])
         .output()
         .context("failed to add MASQUERADE rule")?;
-    
+
     if verify_route().is_none() {
         warn!("Route disappeared after MASQUERADE rule!");
     }
@@ -566,7 +589,7 @@ fn setup_nat(args: &ServerArgs) -> Result<()> {
         ])
         .output()
         .context("failed to add FORWARD rule (in)")?;
-    
+
     if verify_route().is_none() {
         warn!("Route disappeared after FORWARD (in) rule!");
     }
@@ -580,7 +603,7 @@ fn setup_nat(args: &ServerArgs) -> Result<()> {
         ])
         .output()
         .context("failed to add FORWARD rule (out)")?;
-    
+
     if verify_route().is_none() {
         warn!("Route disappeared after FORWARD (out) rule!");
     }
@@ -631,7 +654,7 @@ fn get_default_interface() -> Result<String> {
         .context("failed to run 'ip route'")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     // Parse line like: "default via 192.168.1.1 dev eth0 proto dhcp metric 100"
     if let Some(iface) = stdout.split_whitespace()
         .skip_while(|&w| w != "dev")

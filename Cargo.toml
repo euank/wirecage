@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "wirecagesrv"
-path = "src/server.rs"
+path = "src/srv/main.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -31,6 +31,17 @@ tempfile = "3.13"
 smoltcp = { version = "0.11", features = ["std", "async", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp"] }
 ctrlc = "3.4"
 zerocopy = "0.8.31"
+axum = { version = "0.8", features = ["json"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+rustls-pemfile = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+parking_lot = "0.12"
+dashmap = "5.5"
+tower-http = { version = "0.5", features = ["limit", "cors"] }
 
 [profile.release]
 lto = true

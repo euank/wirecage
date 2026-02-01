@@ -70,7 +70,85 @@ Note: this project was created with LLM assistance. A human has reviewed all the
 
 Per the license, there is no warranty.
 
+## wirecagesrv - Userspace VPN Server
+
+The project also includes `wirecagesrv`, a userspace WireGuard VPN server with:
+
+- **Userspace NAT**: Routes client traffic to the internet without iptables
+- **HTTPS API**: Dynamic peer provisioning via token authentication
+- **No root required**: Runs entirely in userspace (except for binding privileged ports)
+
+### Server Quickstart
+
+```shell
+# Generate a server key
+wg genkey > server.key
+
+# Start the server
+./wirecagesrv \
+  --private-key-file server.key \
+  --auth-token "your-secret-token" \
+  --wg-endpoint "vpn.example.com:51820"
+```
+
+### Client Registration
+
+Clients can register via the API to get a WireGuard configuration:
+
+```shell
+curl -X POST http://localhost:8443/v1/register \
+  -H "Content-Type: application/json" \
+  -d '{"token": "your-secret-token"}'
+```
+
+Response includes a complete WireGuard config file.
+
+### Port Forwarding (Remote Listening)
+
+Clients can request the server to listen on a public port and forward incoming connections back to them (like ngrok):
+
+```shell
+# Create a port forward (TCP port 8080 -> client's port 80)
+curl -X POST http://localhost:8443/v1/portforward \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "your-secret-token",
+    "client_public_key": "<client-public-key-from-registration>",
+    "protocol": "tcp",
+    "public_port": 8080,
+    "target_port": 80
+  }'
+```
+
+Now anyone connecting to `server:8080` will be forwarded to the VPN client's port 80.
+
+```shell
+# Remove a port forward
+curl -X DELETE http://localhost:8443/v1/portforward \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "your-secret-token",
+    "protocol": "tcp",
+    "public_port": 8080
+  }'
+```
+
+### Server Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--private-key-file` | (required) | Path to server's WireGuard private key |
+| `--auth-token` | (required) | Token for API authentication |
+| `--wg-endpoint` | (required) | Public endpoint clients will connect to |
+| `--wg-listen` | `0.0.0.0:51820` | WireGuard UDP listen address |
+| `--api-listen` | `0.0.0.0:8443` | API HTTP(S) listen address |
+| `--server-ip` | `10.200.100.1` | Server's IP in the VPN subnet |
+| `--subnet-mask` | `24` | VPN subnet CIDR mask |
+| `--tls-cert` | (optional) | TLS certificate for HTTPS |
+| `--tls-key` | (optional) | TLS private key for HTTPS |
+
 ## Caveats
 
 - You need access to `/dev/net/tun`
 - ICMP echo is temporarily not supported
+- Server NAT currently supports TCP and UDP only

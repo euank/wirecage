@@ -1,6 +1,7 @@
 // WireGuard Server - userspace VPN server using gotatun
 // Routes client traffic to the internet with NAT
 
+mod srv;
 mod server_args;
 mod server_peer;
 

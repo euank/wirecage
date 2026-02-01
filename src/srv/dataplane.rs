@@ -24,6 +24,7 @@ use super::wg::{WgIo, WgToDataplane};
 /// Message from WAN socket back to dataplane
 #[derive(Debug)]
 enum WanToDataplane {
+    // Outbound NAT: data from internet to send to client
     TcpData {
         flow_key: FlowKey,
         data: Vec<u8>,
@@ -34,6 +35,14 @@ enum WanToDataplane {
     UdpData {
         flow_key: FlowKey,
         data: Vec<u8>,
+    },
+    // Inbound port forward: data from internet client to send to VPN client
+    InboundTcpData {
+        flow_key: InboundFlowKey,
+        data: Vec<u8>,
+    },
+    InboundTcpClosed {
+        flow_key: InboundFlowKey,
     },
 }
 
@@ -391,35 +400,55 @@ impl Dataplane {
         // Send SYN to the VPN client
         self.send_inbound_tcp_syn(&flow_key).await;
 
-        // Spawn task to handle the TCP stream
-        let wan_tx_back = self.wan_tx_template.clone();
-        let wg_io = Arc::clone(&self.wg_io);
-        let peer_pubkey = rule.peer_pubkey;
-        let peer_ip = rule.peer_ip;
-        let target_port = rule.target_port;
-
-        // Note: For full implementation, we'd need bidirectional relay
-        // For now, spawn reader task
+        // Split the TCP stream for bidirectional relay
         let (mut read_half, mut write_half) = stream.into_split();
 
-        // Reader: forward data from internet client to VPN client
-        let flow_key_clone = flow_key;
+        // Channel for VPN client -> internet client data
+        let wan_tx_back = self.wan_tx_template.clone();
+        let flow_key_for_reader = flow_key;
+
+        // Reader task: forward data from internet client to dataplane
+        // (dataplane will then send to VPN client as TCP packets)
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             loop {
                 match read_half.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        // Data from internet goes to VPN client
-                        // This would need to be sent as TCP data packet
-                        trace!("Inbound TCP data: {} bytes", n);
+                    Ok(0) => {
+                        // Connection closed
+                        let _ = wan_tx_back
+                            .send(WanToDataplane::InboundTcpClosed {
+                                flow_key: flow_key_for_reader,
+                            })
+                            .await;
+                        break;
                     }
-                    Err(_) => break,
+                    Ok(n) => {
+                        // Forward data to dataplane
+                        if wan_tx_back
+                            .send(WanToDataplane::InboundTcpData {
+                                flow_key: flow_key_for_reader,
+                                data: buf[..n].to_vec(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Inbound TCP read error: {}", e);
+                        let _ = wan_tx_back
+                            .send(WanToDataplane::InboundTcpClosed {
+                                flow_key: flow_key_for_reader,
+                            })
+                            .await;
+                        break;
+                    }
                 }
             }
         });
 
-        // Writer: forward data from VPN client to internet client
+        // Writer task: forward data from VPN client to internet client
         tokio::spawn(async move {
             while let Some(data) = wan_rx.recv().await {
                 if let Err(e) = write_half.write_all(&data).await {
@@ -455,6 +484,61 @@ impl Dataplane {
         );
 
         self.send_to_client(&flow.rule.peer_pubkey, &packet).await;
+    }
+
+    /// Send TCP data to VPN client for inbound connection
+    async fn send_inbound_tcp_data(&mut self, flow_key: &InboundFlowKey, data: &[u8]) {
+        let Some(flow) = self.inbound_tcp_flows.get(flow_key) else {
+            return;
+        };
+
+        // Only send data if connection is established
+        if flow.state != TcpFlowState::Established {
+            debug!("Inbound flow not established, queuing data");
+            return;
+        }
+
+        let packet = build_tcp_packet(
+            flow_key.remote_ip,         // src (internet client)
+            flow.rule.peer_ip,          // dst (VPN client)
+            flow.simulated_client_port, // src port
+            flow.rule.target_port,      // dst port
+            flow.our_seq.wrapping_add(1),
+            flow.client_seq.wrapping_add(1),
+            TcpFlags::ACK | TcpFlags::PSH,
+            data,
+        );
+
+        self.send_to_client(&flow.rule.peer_pubkey, &packet).await;
+
+        // Update sequence number
+        if let Some(flow) = self.inbound_tcp_flows.get_mut(flow_key) {
+            flow.our_seq = flow.our_seq.wrapping_add(data.len() as u32);
+            flow.last_activity = Instant::now();
+        }
+
+        debug!("Sent {} bytes to VPN client via inbound flow", data.len());
+    }
+
+    /// Send TCP FIN to VPN client for inbound connection
+    async fn send_inbound_tcp_fin(&self, flow_key: &InboundFlowKey) {
+        let Some(flow) = self.inbound_tcp_flows.get(flow_key) else {
+            return;
+        };
+
+        let packet = build_tcp_packet(
+            flow_key.remote_ip,
+            flow.rule.peer_ip,
+            flow.simulated_client_port,
+            flow.rule.target_port,
+            flow.our_seq.wrapping_add(1),
+            flow.client_seq.wrapping_add(1),
+            TcpFlags::FIN | TcpFlags::ACK,
+            &[],
+        );
+
+        self.send_to_client(&flow.rule.peer_pubkey, &packet).await;
+        debug!("Sent FIN to VPN client for inbound flow");
     }
 
     /// Handle inbound UDP packet
@@ -535,6 +619,80 @@ impl Dataplane {
         let seq = tcp.seq_number().0 as u32;
         let ack = tcp.ack_number().0 as u32;
 
+        trace!(
+            "TCP {}:{} -> {}:{} flags: SYN={} ACK={} FIN={} RST={}",
+            src_ip, src_port, dst_ip, dst_port,
+            tcp.syn(), tcp.ack(), tcp.fin(), tcp.rst()
+        );
+
+        // First, check if this is a response to an inbound port-forward flow
+        // For inbound flows, the client (src_ip) is responding to our SYN
+        // Look for a flow where:
+        //   - peer_ip matches src_ip (client is sending)
+        //   - target_port matches src_port (client's listening port)
+        //   - remote_ip matches dst_ip (destination is the internet client)
+        for (inbound_key, inbound_flow) in self.inbound_tcp_flows.iter_mut() {
+            if inbound_flow.rule.peer_ip == src_ip
+                && inbound_flow.rule.target_port == src_port
+                && inbound_key.remote_ip == dst_ip
+                && inbound_flow.simulated_client_port == dst_port
+            {
+                // This is a response to an inbound flow
+                inbound_flow.last_activity = Instant::now();
+
+                if tcp.syn() && tcp.ack() {
+                    // SYN-ACK from client - connection accepted
+                    debug!("Inbound flow: received SYN-ACK from client");
+                    inbound_flow.client_seq = seq;
+                    inbound_flow.state = TcpFlowState::Established;
+
+                    // Send ACK to complete handshake
+                    let ack_packet = build_tcp_packet(
+                        dst_ip,  // from internet client
+                        src_ip,  // to VPN client
+                        dst_port,
+                        src_port,
+                        inbound_flow.our_seq.wrapping_add(1),
+                        seq.wrapping_add(1),
+                        TcpFlags::ACK,
+                        &[],
+                    );
+                    self.send_to_client(peer_pubkey, &ack_packet).await;
+                    return;
+                }
+
+                if tcp.ack() && !tcp.syn() && !tcp.fin() {
+                    // Data or ACK from client
+                    let payload = tcp.payload();
+                    if !payload.is_empty() {
+                        debug!("Inbound flow: {} bytes from client", payload.len());
+                        // Forward data to the internet client via wan_tx
+                        if inbound_flow.wan_tx.try_send(payload.to_vec()).is_err() {
+                            warn!("Inbound flow: WAN channel full");
+                        }
+                    }
+                    return;
+                }
+
+                if tcp.fin() {
+                    debug!("Inbound flow: FIN from client");
+                    inbound_flow.state = TcpFlowState::FinWait;
+                    // Forward FIN to internet client (close the connection)
+                    return;
+                }
+
+                if tcp.rst() {
+                    debug!("Inbound flow: RST from client");
+                    // Connection rejected/reset
+                    return;
+                }
+
+                return;
+            }
+        }
+
+        // Not an inbound flow response - handle as outbound NAT
+
         let flow_key = FlowKey {
             protocol: Protocol::Tcp,
             client_ip: src_ip,
@@ -543,13 +701,7 @@ impl Dataplane {
             remote_port: dst_port,
         };
 
-        trace!(
-            "TCP {}:{} -> {}:{} flags: SYN={} ACK={} FIN={} RST={}",
-            src_ip, src_port, dst_ip, dst_port,
-            tcp.syn(), tcp.ack(), tcp.fin(), tcp.rst()
-        );
-
-        // Handle SYN - new connection
+        // Handle SYN - new outbound connection
         if tcp.syn() && !tcp.ack() {
             if self.tcp_flows.contains_key(&flow_key) {
                 debug!("Duplicate SYN for existing flow");
@@ -872,6 +1024,15 @@ impl Dataplane {
                     flow.last_activity = Instant::now();
                     self.send_udp_response(&flow_key, &data).await;
                 }
+            }
+            WanToDataplane::InboundTcpData { flow_key, data } => {
+                // Data from internet client to forward to VPN client
+                self.send_inbound_tcp_data(&flow_key, &data).await;
+            }
+            WanToDataplane::InboundTcpClosed { flow_key } => {
+                // Internet client closed connection - send FIN to VPN client
+                self.send_inbound_tcp_fin(&flow_key).await;
+                self.inbound_tcp_flows.remove(&flow_key);
             }
         }
     }

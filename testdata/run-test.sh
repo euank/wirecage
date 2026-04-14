@@ -1,41 +1,67 @@
 #!/usr/bin/env bash
-# Quick test runner - starts server and runs a ping test
+# Quick local smoke test using the current API-driven wirecagesrv flow.
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-SERVER_PUBKEY=$(cat testdata/server-public.key)
-CLIENT_PUBKEY=$(cat testdata/client-public.key)
+AUTH_TOKEN="wirecage-local-test"
+WG_PORT="51820"
+API_PORT="18443"
+CLIENT_KEY_FILE="/tmp/wirecage-local-client.key"
+REGISTER_JSON="/tmp/wirecage-local-register.json"
 
 echo "Starting WireGuard server..."
-sudo ./target/release/wirecagesrv \
+./target/release/wirecagesrv \
   --private-key-file testdata/server-private.key \
-  --listen-addr 127.0.0.1:51820 \
-  --peer "$CLIENT_PUBKEY,10.200.100.2/32" &
+  --auth-token "$AUTH_TOKEN" \
+  --wg-endpoint "127.0.0.1:$WG_PORT" \
+  --wg-listen "127.0.0.1:$WG_PORT" \
+  --api-listen "127.0.0.1:$API_PORT" &
 
 SERVER_PID=$!
 
 # Ensure cleanup on exit
-trap "echo 'Stopping server...'; sudo kill $SERVER_PID 2>/dev/null || true" EXIT
+trap "echo 'Stopping server...'; kill $SERVER_PID 2>/dev/null || true; rm -f '$CLIENT_KEY_FILE' '$REGISTER_JSON'" EXIT
 
 echo "Waiting for server to start..."
 sleep 3
 
+echo "Registering a client..."
+curl -fsS -X POST "http://127.0.0.1:$API_PORT/v1/register" \
+  -H "Content-Type: application/json" \
+  -d "{\"token\":\"$AUTH_TOKEN\"}" \
+  > "$REGISTER_JSON"
+
+readarray -t REGISTERED < <(python3 - "$REGISTER_JSON" "$CLIENT_KEY_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+pathlib.Path(sys.argv[2]).write_text(data["client_private_key"] + "\n")
+print(data["client_address"].split("/")[0])
+print(data["server_public_key"])
+PY
+)
+
+CLIENT_WG_IP="${REGISTERED[0]}"
+SERVER_PUBKEY="${REGISTERED[1]}"
+
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "Running ping test through WireGuard tunnel..."
+echo "Running HTTP smoke test through WireGuard tunnel..."
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
 ./target/release/wirecage \
-  --wg-endpoint 127.0.0.1:51820 \
+  --wg-endpoint "127.0.0.1:$WG_PORT" \
   --wg-public-key "$SERVER_PUBKEY" \
-  --wg-private-key-file testdata/client-private.key \
-  --wg-address 10.200.100.2 \
+  --wg-private-key-file "$CLIENT_KEY_FILE" \
+  --wg-address "$CLIENT_WG_IP" \
   --no-overlay \
-  -- ping -c 3 1.1.1.1
+  -- curl -fsS --max-time 10 http://example.com
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"

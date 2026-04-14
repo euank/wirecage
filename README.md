@@ -6,30 +6,28 @@ No root required (assuming unprivileged user namespaces are enabled).
 
 ## Quickstart
 
-You can run any command and force it to route through wireguard.
+You can run any command and force it to route through WireGuard.
 
 Want to run firefox through a vpn without affecting your other software? Put it in a wirecage:
 
 ```shell
-./wirecage \
-  --wg-endpoint "<wireguard server endpoint>" \
-  --wg-public-key "<base64 wireguard server public key>" \
-  --wg-private-key-file "/path/to/wireguard/private/key" \
-  --wg-address "<our wireguard ip>" \
-  -- firefox
+wirecage add-server work https://vpn.example.com --token "<registration token>"
+wirecage run work -- firefox
 ```
 
-Create a profile and browse around, and you'll see that you appear to be coming from your wireguard server's IP :)
+The first `wirecage run` for a named server will:
+
+- generate a local client private key under `~/.config/wirecage/keys/`
+- register the matching public key with the server
+- receive an assigned VPN address and the server WireGuard metadata
+- start the jailed process in one command
+
+Create a profile and browse around, and you'll see that you appear to be coming from your WireGuard server's IP :)
 
 You can also run simple tools like curl:
 
 ```shell
-./wirecage \
-  --wg-endpoint "<wireguard server endpoint>" \
-  --wg-public-key "<base64 wireguard server public key>" \
-  --wg-private-key-file "/path/to/wireguard/private/key" \
-  --wg-address "<our wireguard ip>" \
-  -- curl -4 https://api.myip.com
+wirecage run work -- curl -4 https://api.myip.com
 
 {"ip": "<wireguard server ip>"}
 ```
@@ -37,9 +35,7 @@ You can also run simple tools like curl:
 You can also open a shell and look around:
 
 ```shell
-wirecage \
-  ... \
-  bash
+wirecage run work -- bash
 
 # ip addr
 
@@ -50,6 +46,18 @@ wirecage \
 
 As you can see, the only route is to a tun interface, and that interface will
 route straight to wireguard, ensuring proper network isolation.
+
+`wirecage add-server` writes a human-editable TOML file at `~/.config/wirecage/config.toml`:
+
+```toml
+version = 1
+
+[servers.work]
+api_url = "https://vpn.example.com"
+token = "your-secret-token"
+```
+
+You can edit that file directly if you prefer.
 
 ## Ubuntu 23.10 and later
 
@@ -76,6 +84,7 @@ The project also includes `wirecagesrv`, a userspace WireGuard VPN server with:
 
 - **Userspace NAT**: Routes client traffic to the internet without iptables
 - **HTTPS API**: Dynamic peer provisioning via token authentication
+- **Port forwarding**: Server-side public listeners forwarded back to VPN clients
 - **No root required**: Runs entirely in userspace (except for binding privileged ports)
 
 ### Server Quickstart
@@ -93,15 +102,28 @@ wg genkey > server.key
 
 ### Client Registration
 
-Clients can register via the API to get a WireGuard configuration:
+Clients register by sending their own WireGuard public key to the API. The server assigns an address and returns the server-side connection metadata; it does not generate or return a client private key.
 
 ```shell
 curl -X POST http://localhost:8443/v1/register \
   -H "Content-Type: application/json" \
-  -d '{"token": "your-secret-token"}'
+  -d '{
+    "token": "your-secret-token",
+    "client_public_key": "<base64-client-public-key>"
+  }'
 ```
 
-Response includes a complete WireGuard config file.
+Example response:
+
+```json
+{
+  "client_address": "10.200.100.2/24",
+  "server_public_key": "<base64-server-public-key>",
+  "server_endpoint": "vpn.example.com:51820"
+}
+```
+
+See [docs/client-server-status.md](/home/esk/dev/wirecage/docs/client-server-status.md) for the current client/server architecture, test status, and notes on legacy server artifacts still present in the repo.
 
 ### Port Forwarding (Remote Listening)
 

@@ -1,325 +1,388 @@
 #!/usr/bin/env bash
-# Integration test for wirecage
-# Sets up a local WireGuard server in a network namespace and tests connectivity
+# Host-local end-to-end smoke test for the named-server client UX.
+#
+# This test:
+# 1. Starts wirecagesrv on the host
+# 2. Uses `wirecage add-server` to create a local TOML config
+# 3. Uses `wirecage run <name>` to auto-register and jail commands
+# 4. Verifies outbound HTTP/TCP connectivity through the VPN dataplane
+# 5. Verifies end-to-end TCP port forwarding back to a client-side service
 
 set -euo pipefail
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Test configuration
-SERVER_NS="wirecage-test-server"
-CLIENT_PRIVKEY_FILE="/tmp/wirecage-test-client.key"
+SERVER_NAME="test-server"
+TEST_CONFIG_HOME="/tmp/wirecage-config-home"
 SERVER_PRIVKEY_FILE="/tmp/wirecage-test-server.key"
-SERVER_PUBKEY_FILE="/tmp/wirecage-test-server.pub"
-CLIENT_PUBKEY_FILE="/tmp/wirecage-test-client.pub"
-WG_SERVER_IP="10.200.100.1"
-WG_CLIENT_IP="10.200.100.2"
+AUTH_TOKEN="wirecage-test-token"
 WG_SERVER_PORT="51820"
-SERVER_VETH="veth-srv"
-HOST_VETH="veth-host"
-HOST_VETH_IP="192.168.100.1"
-SERVER_VETH_IP="192.168.100.2"
+API_PORT="18443"
+SERVER_HTTP_PORT="18080"
+FORWARD_PORT="19080"
+CLIENT_SERVICE_PORT="8081"
+HOST_TEST_IP=""
+WIRECAGE_CLIENT_KEY=""
+WIRECAGE_CLIENT_PUBKEY=""
 
-# Cleanup function
 cleanup() {
     echo -e "${YELLOW}Cleaning up...${NC}"
-    
-    # Kill wirecagesrv
+
     if [ -f /tmp/wirecagesrv.pid ]; then
-        sudo kill $(cat /tmp/wirecagesrv.pid) 2>/dev/null || true
+        kill "$(cat /tmp/wirecagesrv.pid)" 2>/dev/null || true
+        wait "$(cat /tmp/wirecagesrv.pid)" 2>/dev/null || true
         rm -f /tmp/wirecagesrv.pid
     fi
-    
-    # Kill background processes
+
+    if [ -f /tmp/wirecage-client.pid ]; then
+        kill "$(cat /tmp/wirecage-client.pid)" 2>/dev/null || true
+        wait "$(cat /tmp/wirecage-client.pid)" 2>/dev/null || true
+        rm -f /tmp/wirecage-client.pid
+    fi
+
+    if [ -f /tmp/wirecage-server-http.pid ]; then
+        kill "$(cat /tmp/wirecage-server-http.pid)" 2>/dev/null || true
+        wait "$(cat /tmp/wirecage-server-http.pid)" 2>/dev/null || true
+        rm -f /tmp/wirecage-server-http.pid
+    fi
+
     jobs -p | xargs -r kill 2>/dev/null || true
     wait 2>/dev/null || true
-    
-    # Delete network namespace
-    sudo ip netns del "$SERVER_NS" 2>/dev/null || true
-    
-    # Clean up veth pairs
-    sudo ip link del "$HOST_VETH" 2>/dev/null || true
-    
-    # Remove temporary files
-    rm -f "$CLIENT_PRIVKEY_FILE" "$SERVER_PRIVKEY_FILE" "$SERVER_PUBKEY_FILE" "$CLIENT_PUBKEY_FILE"
-    rm -f /tmp/wg-test.conf /tmp/wirecagesrv.log
-    
+
+    rm -rf "$TEST_CONFIG_HOME"
+    rm -f "$SERVER_PRIVKEY_FILE"
+    rm -f /tmp/wirecagesrv.log /tmp/test-http.log /tmp/test-tcp.log /tmp/test-forward.log
+    rm -f /tmp/wirecage-client.log /tmp/wirecage-client-prime.log /tmp/wirecage-client-ready /tmp/pf-response.json
+    rm -rf /tmp/wirecage-server-www
+
     echo -e "${YELLOW}Cleanup complete${NC}"
 }
 
-# Set up cleanup trap
 trap cleanup EXIT INT TERM
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
+log_fail() { echo -e "${RED}[✗]${NC} $1"; }
+
+dump_diagnostics() {
+    echo "  wirecagesrv log:"
+    sed -n '1,220p' /tmp/wirecagesrv.log 2>/dev/null | sed 's/^/    /' || true
+    echo "  wirecage client log:"
+    sed -n '1,220p' /tmp/wirecage-client.log 2>/dev/null | sed 's/^/    /' || true
+    echo "  wirecage client prime log:"
+    sed -n '1,120p' /tmp/wirecage-client-prime.log 2>/dev/null | sed 's/^/    /' || true
 }
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+wc_cmd() {
+    XDG_CONFIG_HOME="$TEST_CONFIG_HOME" ./target/release/wirecage "$@"
 }
 
-log_success() {
-    echo -e "${GREEN}[✓]${NC} $1"
-}
-
-log_fail() {
-    echo -e "${RED}[✗]${NC} $1"
-}
-
-# Check prerequisites
 check_prerequisites() {
     log_info "Checking prerequisites..."
-    
+
     if [ ! -f "./target/release/wirecage" ]; then
         log_error "wirecage binary not found. Run: cargo build --release"
         exit 1
     fi
-    
+
     if [ ! -f "./target/release/wirecagesrv" ]; then
         log_error "wirecagesrv binary not found. Run: cargo build --release"
         exit 1
     fi
-    
-    if ! command -v wg &> /dev/null; then
-        log_error "wg command not found. Install wireguard-tools"
-        exit 1
-    fi
-    
+
+    for cmd in wg curl python3 nc jq ip grep; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            log_error "Required command not found: $cmd"
+            exit 1
+        fi
+    done
+
     log_success "Prerequisites check passed"
 }
 
-# Generate WireGuard keys
-generate_keys() {
-    log_info "Generating WireGuard keys..."
-    
-    # Generate server keys
+detect_host_test_ip() {
+    log_info "Detecting a non-loopback host IP for dataplane tests..."
+    HOST_TEST_IP="$(ip route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)"
+
+    if [ -z "$HOST_TEST_IP" ]; then
+        log_error "Could not determine a non-loopback host IP"
+        exit 1
+    fi
+
+    log_success "Using host IP $HOST_TEST_IP for smoke tests"
+}
+
+generate_server_key() {
+    log_info "Generating server WireGuard key..."
+    umask 077
     wg genkey > "$SERVER_PRIVKEY_FILE"
-    wg pubkey < "$SERVER_PRIVKEY_FILE" > "$SERVER_PUBKEY_FILE"
-    
-    # Generate client keys
-    wg genkey > "$CLIENT_PRIVKEY_FILE"
-    wg pubkey < "$CLIENT_PRIVKEY_FILE" > "$CLIENT_PUBKEY_FILE"
-    
-    chmod 600 "$SERVER_PRIVKEY_FILE" "$CLIENT_PRIVKEY_FILE"
-    
-    log_success "Keys generated"
+    chmod 600 "$SERVER_PRIVKEY_FILE"
+    log_success "Server key generated"
 }
 
-# Set up server network namespace
-setup_server_namespace() {
-    log_info "Setting up server network namespace..."
-    
-    # Create namespace
-    sudo ip netns add "$SERVER_NS"
-    
-    # Create veth pair to connect host and server namespace
-    sudo ip link add "$HOST_VETH" type veth peer name "$SERVER_VETH"
-    
-    # Move server end to namespace
-    sudo ip link set "$SERVER_VETH" netns "$SERVER_NS"
-    
-    # Configure host end
-    sudo ip addr add "$HOST_VETH_IP/24" dev "$HOST_VETH"
-    sudo ip link set "$HOST_VETH" up
-    
-    # Configure server end inside namespace
-    sudo ip netns exec "$SERVER_NS" ip addr add "$SERVER_VETH_IP/24" dev "$SERVER_VETH"
-    sudo ip netns exec "$SERVER_NS" ip link set "$SERVER_VETH" up
-    sudo ip netns exec "$SERVER_NS" ip link set lo up
-    
-    log_success "Server namespace created"
-}
+start_server() {
+    log_info "Starting wirecagesrv on the host..."
 
-# Set up WireGuard server using wirecagesrv
-setup_wireguard_server() {
-    log_info "Setting up WireGuard server (wirecagesrv)..."
-    
-    local client_pubkey=$(cat "$CLIENT_PUBKEY_FILE")
-    
-    # Start wirecagesrv in the server namespace
-    sudo ip netns exec "$SERVER_NS" \
-        ./target/release/wirecagesrv \
+    ./target/release/wirecagesrv \
         --private-key-file "$SERVER_PRIVKEY_FILE" \
-        --listen-addr "$SERVER_VETH_IP:$WG_SERVER_PORT" \
-        --subnet "$WG_SERVER_IP" \
-        --subnet-cidr "10.200.100.0/24" \
-        --tun-name wg-srv \
-        --peer "$client_pubkey,$WG_CLIENT_IP/32" \
+        --auth-token "$AUTH_TOKEN" \
+        --wg-endpoint "127.0.0.1:$WG_SERVER_PORT" \
+        --wg-listen "127.0.0.1:$WG_SERVER_PORT" \
+        --api-listen "127.0.0.1:$API_PORT" \
         > /tmp/wirecagesrv.log 2>&1 &
-    
+
     echo $! > /tmp/wirecagesrv.pid
-    
-    # Give server time to start
     sleep 2
-    
-    if ! kill -0 $(cat /tmp/wirecagesrv.pid) 2>/dev/null; then
+
+    if ! kill -0 "$(cat /tmp/wirecagesrv.pid)" 2>/dev/null; then
         log_error "wirecagesrv failed to start"
         cat /tmp/wirecagesrv.log
-        return 1
+        exit 1
     fi
-    
-    log_success "WireGuard server started (PID: $(cat /tmp/wirecagesrv.pid))"
-    
-    # Verify server is running
-    echo "  Server log:"
-    head -10 /tmp/wirecagesrv.log | sed 's/^/    /'
+
+    log_success "wirecagesrv started (PID: $(cat /tmp/wirecagesrv.pid))"
 }
 
-# Start test HTTP server in server namespace
-start_http_server() {
-    log_info "Starting HTTP server in server namespace..."
-    
-    # Create a test directory with content
-    mkdir -p /tmp/wirecage-www
-    echo "<h1>WireCage Test Server</h1><p>Connection successful!</p>" > /tmp/wirecage-www/index.html
-    
-    # Start a simple HTTP server on port 8080 in the server namespace
-    # Bind to 0.0.0.0 since the WG interface might take a moment to be fully ready
-    sudo ip netns exec "$SERVER_NS" sh -c "cd /tmp/wirecage-www && python3 -m http.server 8080 --bind 0.0.0.0" >/dev/null 2>&1 &
-    
-    # Give it time to start
+configure_named_server() {
+    log_info "Writing the local WireCage config through add-server..."
+    rm -rf "$TEST_CONFIG_HOME"
+
+    wc_cmd add-server "$SERVER_NAME" "http://127.0.0.1:$API_PORT" --token "$AUTH_TOKEN" >/tmp/wirecage-add-server.log 2>&1
+
+    local config_file="$TEST_CONFIG_HOME/wirecage/config.toml"
+    if [ ! -f "$config_file" ]; then
+        log_error "Expected config file was not created"
+        cat /tmp/wirecage-add-server.log
+        exit 1
+    fi
+
+    if grep -q '\[servers.test-server\]' "$config_file" && grep -q "api_url = \"http://127.0.0.1:$API_PORT\"" "$config_file"; then
+        log_success "Named server config written to $config_file"
+    else
+        log_error "Config file did not contain the expected server entry"
+        cat "$config_file"
+        exit 1
+    fi
+}
+
+discover_client_key() {
+    WIRECAGE_CLIENT_KEY="$TEST_CONFIG_HOME/wirecage/keys/${SERVER_NAME}.key"
+    if [ ! -f "$WIRECAGE_CLIENT_KEY" ]; then
+        log_error "Expected client key was not created at $WIRECAGE_CLIENT_KEY"
+        exit 1
+    fi
+
+    WIRECAGE_CLIENT_PUBKEY="$(wg pubkey < "$WIRECAGE_CLIENT_KEY")"
+    if [ -z "$WIRECAGE_CLIENT_PUBKEY" ]; then
+        log_error "Failed to derive client public key"
+        exit 1
+    fi
+}
+
+start_server_http_service() {
+    log_info "Starting host-side HTTP service for outbound dataplane tests..."
+
+    mkdir -p /tmp/wirecage-server-www
+    echo "<h1>WireCage Test Server</h1><p>Connection successful!</p>" > /tmp/wirecage-server-www/index.html
+
+    python3 -m http.server "$SERVER_HTTP_PORT" --bind "$HOST_TEST_IP" -d /tmp/wirecage-server-www >/tmp/wirecage-server-http.log 2>&1 &
+    echo $! > /tmp/wirecage-server-http.pid
     sleep 2
-    
-    # Verify it's running
-    if sudo ip netns exec "$SERVER_NS" ss -tuln | grep -q ":8080"; then
-        log_success "HTTP server started and listening on port 8080"
-    else
-        log_error "HTTP server failed to start"
-        # Try to see what went wrong
-        sudo ip netns exec "$SERVER_NS" ss -tuln
-        return 1
+
+    if ! kill -0 "$(cat /tmp/wirecage-server-http.pid)" 2>/dev/null; then
+        log_error "Host-side HTTP service failed to start"
+        cat /tmp/wirecage-server-http.log
+        exit 1
     fi
+
+    log_success "Host-side HTTP service started on $HOST_TEST_IP:$SERVER_HTTP_PORT"
 }
 
-# Run connectivity tests
+start_client_service() {
+    log_info "Starting client-side TCP responder under wirecage..."
+
+    wc_cmd run "$SERVER_NAME" -- bash -lc "
+        set -euo pipefail
+        python3 - <<'PY' >/tmp/wirecage-client-http.log 2>&1 &
+import socket
+import time
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(('0.0.0.0', $CLIENT_SERVICE_PORT))
+listener.listen(5)
+
+while True:
+    conn, _ = listener.accept()
+    with conn:
+        conn.settimeout(5)
+        try:
+            conn.recv(4096)
+        except Exception:
+            pass
+        conn.sendall(b'PORT_FORWARD_OK\n')
+        time.sleep(1)
+PY
+        server_pid=\$!
+        trap 'kill \$server_pid 2>/dev/null || true' EXIT
+        for _ in \$(seq 1 20); do
+            if nc -z -w 2 $HOST_TEST_IP $SERVER_HTTP_PORT >/tmp/wirecage-client-prime.log 2>&1; then
+                echo ready >/tmp/wirecage-client-ready
+                wait \$server_pid
+                exit 0
+            fi
+            sleep 1
+        done
+        echo 'Failed to prime client tunnel' >&2
+        exit 1
+    " > /tmp/wirecage-client.log 2>&1 &
+
+    echo $! > /tmp/wirecage-client.pid
+
+    for _ in $(seq 1 20); do
+        if [ -f /tmp/wirecage-client-ready ]; then
+            break
+        fi
+        if ! kill -0 "$(cat /tmp/wirecage-client.pid)" 2>/dev/null; then
+            log_error "Client-side service exited while priming"
+            cat /tmp/wirecage-client.log
+            exit 1
+        fi
+        sleep 1
+    done
+
+    if [ ! -f /tmp/wirecage-client-ready ]; then
+        log_error "Client-side service failed to establish the tunnel"
+        cat /tmp/wirecage-client.log
+        cat /tmp/wirecage-client-prime.log 2>/dev/null || true
+        exit 1
+    fi
+
+    discover_client_key
+    log_success "Client-side service is running"
+}
+
+create_port_forward() {
+    log_info "Creating end-to-end TCP port forward..."
+    local status
+
+    status=$(curl -sS -o /tmp/pf-response.json -w '%{http_code}' -X POST "http://127.0.0.1:$API_PORT/v1/portforward" \
+        -H "Content-Type: application/json" \
+        -d "{\"token\":\"$AUTH_TOKEN\",\"client_public_key\":\"$WIRECAGE_CLIENT_PUBKEY\",\"protocol\":\"tcp\",\"public_port\":$FORWARD_PORT,\"target_port\":$CLIENT_SERVICE_PORT}")
+
+    if [[ "$status" != "201" ]]; then
+        log_error "Failed to create port forward (HTTP $status)"
+        cat /tmp/pf-response.json
+        exit 1
+    fi
+
+    if ! jq -e ".public_port == $FORWARD_PORT and .target_port == $CLIENT_SERVICE_PORT and .protocol == \"tcp\"" /tmp/pf-response.json >/dev/null; then
+        log_error "Unexpected port-forward response"
+        cat /tmp/pf-response.json
+        exit 1
+    fi
+
+    sleep 1
+    log_success "TCP port forward created"
+}
+
 run_tests() {
-    log_info "Running connectivity tests..."
-    
-    local server_pubkey=$(cat "$SERVER_PUBKEY_FILE")
-    local server_endpoint="$SERVER_VETH_IP:$WG_SERVER_PORT"  # Connect to the server namespace IP, not host
+    log_info "Running host-local smoke tests..."
     local failures=0
-    
-    # Pre-flight check: Can we reach the WireGuard server endpoint?
+
     echo ""
-    log_info "Pre-flight: Testing connectivity to $server_endpoint"
-    if nc -uz -w 1 $SERVER_VETH_IP $WG_SERVER_PORT 2>/dev/null; then
-        log_success "UDP port $WG_SERVER_PORT is reachable"
-    else
-        log_fail "Cannot reach UDP port $WG_SERVER_PORT - WireGuard server may not be accessible"
-    fi
-    
-    # Test 1: Ping
-    echo ""
-    log_info "Test 1: Ping $WG_SERVER_IP"
-    if timeout 10 ./target/release/wirecage \
-        --log-level=debug \
-        --wg-endpoint "$server_endpoint" \
-        --wg-public-key "$server_pubkey" \
-        --wg-private-key-file "$CLIENT_PRIVKEY_FILE" \
-        --wg-address "$WG_CLIENT_IP" \
-        --no-overlay \
-        -- ping -W 2 -c 3 "$WG_SERVER_IP" > /tmp/test-ping.log 2>&1; then
-        log_success "Ping test passed"
-        echo "  Sample output:"
-        tail -3 /tmp/test-ping.log | sed 's/^/  /'
-    else
-        log_fail "Ping test failed"
-        echo "  Output:"
-        tail -10 /tmp/test-ping.log | sed 's/^/  /'
-        echo "  WireGuard server status:"
-        sudo ip netns exec "$SERVER_NS" wg show wg-test | sed 's/^/  /'
-        failures=$((failures + 1))
-    fi
-    
-    # Test 2: HTTP connectivity
-    echo ""
-    log_info "Test 2: HTTP GET to http://$WG_SERVER_IP:8080"
-    if timeout 5 ./target/release/wirecage \
-        --log-level=info \
-        --wg-endpoint "$server_endpoint" \
-        --wg-public-key "$server_pubkey" \
-        --wg-private-key-file "$CLIENT_PRIVKEY_FILE" \
-        --wg-address "$WG_CLIENT_IP" \
-        --no-overlay \
-        -- curl -s -m 2 "http://$WG_SERVER_IP:8080/" > /tmp/test-http.log 2>&1; then
+    log_info "Test 1: HTTP GET via wirecage run $SERVER_NAME"
+    if timeout 20 env XDG_CONFIG_HOME="$TEST_CONFIG_HOME" ./target/release/wirecage run "$SERVER_NAME" -- curl -fsS --max-time 5 "http://$HOST_TEST_IP:$SERVER_HTTP_PORT/" > /tmp/test-http.log 2>&1; then
         log_success "HTTP test passed"
-        echo "  Response preview:"
         head -5 /tmp/test-http.log | sed 's/^/  /'
     else
         log_fail "HTTP test failed"
-        echo "  Output:"
         cat /tmp/test-http.log | sed 's/^/  /'
         failures=$((failures + 1))
     fi
-    
-    # Test 3: TCP connectivity (nc/telnet style)
+
+    discover_client_key
+
     echo ""
-    log_info "Test 3: TCP connection to $WG_SERVER_IP:8080"
-    if timeout 5 ./target/release/wirecage \
-        --log-level=info \
-        --wg-endpoint "$server_endpoint" \
-        --wg-public-key "$server_pubkey" \
-        --wg-private-key-file "$CLIENT_PRIVKEY_FILE" \
-        --wg-address "$WG_CLIENT_IP" \
-        --no-overlay \
-        -- bash -c "echo -e 'GET / HTTP/1.0\r\n\r\n' | nc -w 2 $WG_SERVER_IP 8080" > /tmp/test-tcp.log 2>&1; then
-        log_success "TCP connection test passed"
-        echo "  Response preview:"
-        head -3 /tmp/test-tcp.log | sed 's/^/  /'
+    log_info "Test 2: Raw TCP request via wirecage run $SERVER_NAME"
+    if timeout 20 env XDG_CONFIG_HOME="$TEST_CONFIG_HOME" ./target/release/wirecage run "$SERVER_NAME" -- bash -c "printf 'GET / HTTP/1.0\r\nHost: test\r\n\r\n' | nc -w 2 $HOST_TEST_IP $SERVER_HTTP_PORT" > /tmp/test-tcp.log 2>&1; then
+        log_success "TCP connectivity test passed"
+        head -5 /tmp/test-tcp.log | sed 's/^/  /'
     else
-        log_fail "TCP connection test failed"
-        echo "  Output:"
+        log_fail "TCP connectivity test failed"
         cat /tmp/test-tcp.log | sed 's/^/  /'
         failures=$((failures + 1))
     fi
-    
+
     echo ""
-    if [ $failures -eq 0 ]; then
-        log_success "All tests passed! ✓"
-        return 0
+    start_client_service
+    create_port_forward
+
+    echo ""
+    log_info "Test 3: End-to-end TCP port forward via $HOST_TEST_IP:$FORWARD_PORT"
+    if bash -lc "printf 'ping\n' | nc -w 5 $HOST_TEST_IP $FORWARD_PORT" > /tmp/test-forward.log 2>&1; then
+        if grep -q "PORT_FORWARD_OK" /tmp/test-forward.log; then
+            log_success "Port-forward connectivity test passed"
+            head -5 /tmp/test-forward.log | sed 's/^/  /'
+        else
+            log_fail "Port-forward response did not match expected client content"
+            cat /tmp/test-forward.log | sed 's/^/  /'
+            dump_diagnostics
+            failures=$((failures + 1))
+        fi
     else
-        log_fail "$failures test(s) failed"
-        return 1
+        log_fail "Port-forward connectivity test failed"
+        cat /tmp/test-forward.log | sed 's/^/  /'
+        dump_diagnostics
+        failures=$((failures + 1))
     fi
+
+    echo ""
+    if [ "$failures" -eq 0 ]; then
+        log_success "All smoke tests passed"
+        return 0
+    fi
+
+    log_fail "$failures smoke test(s) failed"
+    return 1
 }
 
-# Main execution
 main() {
     echo ""
     echo "======================================"
-    echo "  WireCage Integration Test Suite"
+    echo "  WireCage Host-Local Smoke Test"
     echo "======================================"
     echo ""
-    
+
     check_prerequisites
-    generate_keys
-    setup_server_namespace
-    setup_wireguard_server
-    start_http_server
-    
+    detect_host_test_ip
+    generate_server_key
+    start_server
+    configure_named_server
+    start_server_http_service
+
     echo ""
     echo "======================================"
     echo "  Running Tests"
     echo "======================================"
-    
+
     if run_tests; then
         echo ""
         echo -e "${GREEN}╔════════════════════════════════╗${NC}"
-        echo -e "${GREEN}║   Integration Tests PASSED!   ║${NC}"
+        echo -e "${GREEN}║     Smoke Tests PASSED!       ║${NC}"
         echo -e "${GREEN}╚════════════════════════════════╝${NC}"
         exit 0
     else
         echo ""
         echo -e "${RED}╔════════════════════════════════╗${NC}"
-        echo -e "${RED}║   Integration Tests FAILED!   ║${NC}"
+        echo -e "${RED}║     Smoke Tests FAILED!       ║${NC}"
         echo -e "${RED}╚════════════════════════════════╝${NC}"
         exit 1
     fi
 }
 
-# Run main
 main

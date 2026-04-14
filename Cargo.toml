@@ -37,6 +37,8 @@ rustls = "0.23"
 rustls-pemfile = "2.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rand = "0.8"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 parking_lot = "0.12"

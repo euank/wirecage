@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error};
 use zerocopy::IntoBytes;
 
-use crate::args::Args;
+use crate::args::RunArgs;
 use crate::wireguard::WireGuardTunnel;
 
 /// Packet to send from TUN (in child namespace) to WireGuard (in host namespace)
@@ -17,7 +17,7 @@ type WgToTunPacket = Vec<u8>;
 /// Run WireGuard in the HOST network namespace
 /// This runs before we create the child network namespace
 pub async fn run_wireguard_host(
-    args: &Args,
+    args: &RunArgs,
     private_key: &str,
     tun_to_wg_rx: mpsc::Receiver<TunToWgPacket>,
     wg_to_tun_tx: mpsc::Sender<WgToTunPacket>,
@@ -27,8 +27,8 @@ pub async fn run_wireguard_host(
     // Create WireGuard tunnel in host namespace
     let wg_tunnel = WireGuardTunnel::new_simple(
         private_key,
-        &args.wg_public_key,
-        &args.wg_endpoint,
+        args.wg_public_key(),
+        args.wg_endpoint(),
     )
     .await?;
 
@@ -199,7 +199,7 @@ pub async fn run_wireguard_host(
 /// Run TUN device and smoltcp stack in CHILD network namespace
 /// This runs after entering the new network namespace
 pub async fn run_tun_child(
-    _args: &Args,
+    _args: &RunArgs,
     tun_to_wg_tx: mpsc::Sender<TunToWgPacket>,
     wg_to_tun_rx: mpsc::Receiver<WgToTunPacket>,
     tun_device: Arc<std::sync::Mutex<tun::platform::Device>>,

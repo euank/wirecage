@@ -4,7 +4,7 @@
 //! - Userspace WireGuard (no kernel module needed)
 //! - Userspace NAT via smoltcp (no iptables needed for NAT mode)
 //! - HTTPS API for dynamic peer registration with token auth
-//! - Designed for future port forwarding support
+//! - Inbound TCP/UDP port forwarding managed through the API
 
 mod api;
 mod dataplane;

@@ -1,13 +1,11 @@
-# QEMU Integration Tests
+# Integration Tests
 
-This directory contains QEMU-based integration tests for wirecage.
+This directory contains the maintained shell-based integration tests for `wirecage` and `wirecagesrv`.
 
-## Why QEMU?
+## Modes
 
-- **Full isolation**: Each test runs in its own VM, no host network interference
-- **No root required**: QEMU user-mode networking works without privileges
-- **Reproducible**: Same kernel/environment every time
-- **Realistic**: Tests the actual network stack, not mocked interfaces
+- **Netns mode (default)**: Starts the current binaries directly on the host and exercises the HTTP API and listener lifecycle.
+- **QEMU mode (`--qemu`)**: Intended for fuller isolation, but the current runner does not have separate maintained QEMU-only test cases.
 
 ## Prerequisites
 
@@ -18,24 +16,17 @@ This directory contains QEMU-based integration tests for wirecage.
 ## Running Tests
 
 ```bash
-# Run all QEMU tests
+# Run all maintained integration tests
 ./tests/qemu/run-tests.sh
 
-# Run specific test
-./tests/qemu/run-tests.sh test_userspace_nat
+# Run a specific test
+./tests/qemu/run-tests.sh test_api_register
 ```
 
-## Test Structure
+## Current Tests
 
-- `run-tests.sh` - Main test runner
-- `build-initramfs.sh` - Builds minimal initramfs with test binaries
-- `test_*.sh` - Individual test scripts
-- `common.sh` - Shared test utilities
+- `test_api_register`: Starts `wirecagesrv`, registers peers through `/v1/register`, and verifies auth/IP allocation behavior.
+- `test_port_forward_api`: Starts `wirecagesrv`, creates and removes forwarded listeners through `/v1/portforward`, and checks listener lifecycle behavior.
+- `test_userspace_nat`: Placeholder only. It currently documents the intended full dataplane coverage but does not execute it.
 
-## Tests
-
-| Test | Description |
-|------|-------------|
-| `test_api_register` | Token exchange and peer registration |
-| `test_userspace_nat` | Outbound NAT (client → internet) |
-| `test_port_forward` | Inbound port forwarding (internet → client) |
+For a namespace-based end-to-end smoke test of the current API-driven server flow, use [`integration-test.sh`](/home/esk/dev/wirecage/integration-test.sh).

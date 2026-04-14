@@ -1,4 +1,4 @@
-//! Flow abstraction for NAT and future port forwarding
+//! Flow abstraction for NAT and port forwarding
 //!
 //! A "flow" represents a bidirectional connection between:
 //! - A WireGuard client (via smoltcp socket)
@@ -12,7 +12,7 @@ use std::time::Instant;
 pub enum FlowDirection {
     /// Client initiated connection to internet (NAT outbound)
     Outbound,
-    /// Internet connection to client via server port (future: port forwarding)
+    /// Internet connection to client via a forwarded server port
     Inbound,
 }
 
@@ -96,7 +96,7 @@ impl Default for FlowConfig {
     }
 }
 
-/// Port forwarding rule (for future "remote listening" feature)
+/// Port forwarding rule for server-side remote listening
 #[derive(Debug, Clone)]
 pub struct PortForwardRule {
     pub protocol: Protocol,

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use nix::sched::{unshare, CloneFlags};
 use tracing::debug;
 
-use crate::args::Args;
+use crate::args::RunArgs;
 
 pub enum Stage {
     One,
@@ -19,7 +19,7 @@ impl Stage {
     }
 }
 
-pub fn setup_network_namespace(_args: &Args) -> Result<()> {
+pub fn setup_network_namespace(_args: &RunArgs) -> Result<()> {
     // Create a new network namespace
     debug!("creating network namespace");
     unshare(CloneFlags::CLONE_NEWNET).context("failed to unshare network namespace")?;
@@ -31,7 +31,7 @@ pub fn setup_network_namespace(_args: &Args) -> Result<()> {
 }
 
 pub fn setup_network_interface(
-    args: &Args,
+    args: &RunArgs,
 ) -> Result<std::sync::Arc<std::sync::Mutex<tun::platform::Device>>> {
     // Create TUN device
     debug!("creating and configuring TUN device: {}", args.tun);
@@ -52,7 +52,7 @@ pub fn setup_network_interface(
     Ok(std::sync::Arc::new(std::sync::Mutex::new(tun)))
 }
 
-fn setup_network_config(args: &Args) -> Result<()> {
+fn setup_network_config(args: &RunArgs) -> Result<()> {
     use futures::stream::TryStreamExt;
     use rtnetlink::new_connection;
 
@@ -82,7 +82,10 @@ fn setup_network_config(args: &Args) -> Result<()> {
 
         // Use the WireGuard address as the TUN IP (not the subnet arg)
         // The server's allowed_ips must match this
-        let wg_addr: std::net::IpAddr = args.wg_address.parse().context("invalid wg-address")?;
+        let wg_addr: std::net::IpAddr = args
+            .wg_address()
+            .parse()
+            .context("invalid wg-address")?;
 
         let addr = wg_addr;
         let prefix_len = match addr {

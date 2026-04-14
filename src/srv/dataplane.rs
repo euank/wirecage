@@ -80,6 +80,8 @@ struct InboundTcpFlow {
     client_seq: u32,
     // Channel to send data to the WAN task (to forward to internet client)
     wan_tx: mpsc::Sender<Vec<u8>>,
+    // Data received from the internet client before the VPN-side handshake completes.
+    pending_data: Vec<Vec<u8>>,
     last_activity: Instant,
     state: TcpFlowState,
 }
@@ -391,6 +393,7 @@ impl Dataplane {
             our_seq: rand::random(),
             client_seq: 0,
             wan_tx,
+            pending_data: Vec::new(),
             last_activity: Instant::now(),
             state: TcpFlowState::SynReceived,
         };
@@ -495,6 +498,10 @@ impl Dataplane {
         // Only send data if connection is established
         if flow.state != TcpFlowState::Established {
             debug!("Inbound flow not established, queuing data");
+            if let Some(flow) = self.inbound_tcp_flows.get_mut(flow_key) {
+                flow.pending_data.push(data.to_vec());
+                flow.last_activity = Instant::now();
+            }
             return;
         }
 
@@ -645,6 +652,8 @@ impl Dataplane {
                     debug!("Inbound flow: received SYN-ACK from client");
                     inbound_flow.client_seq = seq;
                     inbound_flow.state = TcpFlowState::Established;
+                    let flow_key_copy = *inbound_key;
+                    let pending = std::mem::take(&mut inbound_flow.pending_data);
 
                     // Send ACK to complete handshake
                     let ack_packet = build_tcp_packet(
@@ -658,6 +667,10 @@ impl Dataplane {
                         &[],
                     );
                     self.send_to_client(peer_pubkey, &ack_packet).await;
+
+                    for data in pending {
+                        self.send_inbound_tcp_data(&flow_key_copy, &data).await;
+                    }
                     return;
                 }
 
@@ -666,10 +679,25 @@ impl Dataplane {
                     let payload = tcp.payload();
                     if !payload.is_empty() {
                         debug!("Inbound flow: {} bytes from client", payload.len());
+                        inbound_flow.client_seq = seq.wrapping_add(payload.len() as u32);
                         // Forward data to the internet client via wan_tx
                         if inbound_flow.wan_tx.try_send(payload.to_vec()).is_err() {
                             warn!("Inbound flow: WAN channel full");
                         }
+
+                        let ack_packet = build_tcp_packet(
+                            dst_ip,
+                            src_ip,
+                            dst_port,
+                            src_port,
+                            inbound_flow.our_seq.wrapping_add(1),
+                            inbound_flow.client_seq,
+                            TcpFlags::ACK,
+                            &[],
+                        );
+                        self.send_to_client(peer_pubkey, &ack_packet).await;
+                    } else {
+                        inbound_flow.client_seq = seq;
                     }
                     return;
                 }
@@ -1007,6 +1035,10 @@ impl Dataplane {
                         // Connection established - send SYN-ACK
                         flow.state = TcpFlowState::Established;
                         self.send_tcp_synack(&flow_key).await;
+                        if let Some(flow) = self.tcp_flows.get_mut(&flow_key) {
+                            // SYN consumes one sequence number.
+                            flow.server_seq = flow.server_seq.wrapping_add(1);
+                        }
                     } else {
                         // Send data packet
                         self.send_tcp_data(&flow_key, &data).await;

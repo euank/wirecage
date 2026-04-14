@@ -17,7 +17,6 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::flow::{PortForwardRule, Protocol};
 use super::state::{PeerInfo, SharedState};
@@ -26,17 +25,15 @@ use super::state::{PeerInfo, SharedState};
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     pub token: String,
+    pub client_public_key: String,
 }
 
 /// Response with WireGuard configuration
 #[derive(Debug, Serialize)]
 pub struct RegisterResponse {
-    pub client_private_key: String,
-    pub client_public_key: String,
     pub client_address: String,
     pub server_public_key: String,
     pub server_endpoint: String,
-    pub wg_config: String,
 }
 
 /// Error response
@@ -120,72 +117,69 @@ async fn register_handler(
         );
     }
 
-    // Generate client keypair
-    let client_secret = StaticSecret::random_from_rng(rand::thread_rng());
-    let client_public = PublicKey::from(&client_secret);
-
-    let client_private_key_b64 = base64::engine::general_purpose::STANDARD.encode(client_secret.as_bytes());
-    let client_public_key_b64 = base64::engine::general_purpose::STANDARD.encode(client_public.as_bytes());
-    let server_public_key_b64 = base64::engine::general_purpose::STANDARD.encode(&ctx.shared.config.server_public_key);
-
-    // Allocate IP
-    let assigned_ip = {
-        let mut pool = ctx.shared.ip_pool.write();
-        match pool.allocate() {
-            Some(ip) => ip,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({"error": "no IPs available"})),
-                );
-            }
+    let client_public_key = match base64::engine::general_purpose::STANDARD.decode(&req.client_public_key)
+    {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid client public key"})),
+            );
         }
     };
 
-    // Create peer info
-    let peer_info = PeerInfo {
-        public_key: *client_public.as_bytes(),
-        assigned_ip,
-        allowed_ips: vec![format!("{}/32", assigned_ip)],
-        created_at: std::time::Instant::now(),
+    let server_public_key_b64 = base64::engine::general_purpose::STANDARD.encode(&ctx.shared.config.server_public_key);
+
+    let existing_ip = {
+        let peers = ctx.shared.peers.read();
+        peers.get_by_pubkey(&client_public_key).map(|peer| peer.assigned_ip)
     };
 
-    // Register peer
-    {
+    let assigned_ip = if let Some(ip) = existing_ip {
+        ip
+    } else {
+        let allocated_ip = {
+            let mut pool = ctx.shared.ip_pool.write();
+            match pool.allocate() {
+                Some(ip) => ip,
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": "no IPs available"})),
+                    );
+                }
+            }
+        };
+
+        let peer_info = PeerInfo {
+            public_key: client_public_key,
+            assigned_ip: allocated_ip,
+            allowed_ips: vec![format!("{}/32", allocated_ip)],
+            created_at: std::time::Instant::now(),
+        };
+
         let mut peers = ctx.shared.peers.write();
         peers.add(peer_info);
-    }
+        allocated_ip
+    };
 
     let client_address = format!("{}/24", assigned_ip);
-
-    // Generate WireGuard config file content
-    let wg_config = format!(
-        "[Interface]\n\
-         PrivateKey = {}\n\
-         Address = {}\n\
-         \n\
-         [Peer]\n\
-         PublicKey = {}\n\
-         Endpoint = {}\n\
-         AllowedIPs = 0.0.0.0/0\n\
-         PersistentKeepalive = 25\n",
-        client_private_key_b64,
-        client_address,
-        server_public_key_b64,
-        ctx.wg_endpoint,
+    info!(
+        "Registered peer {} with IP {}",
+        req.client_public_key,
+        assigned_ip
     );
-
-    info!("Registered new peer with IP {}", assigned_ip);
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "client_private_key": client_private_key_b64,
-            "client_public_key": client_public_key_b64,
             "client_address": client_address,
             "server_public_key": server_public_key_b64,
             "server_endpoint": ctx.wg_endpoint,
-            "wg_config": wg_config,
         })),
     )
 }

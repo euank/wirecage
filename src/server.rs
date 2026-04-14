@@ -1,5 +1,5 @@
-// WireGuard Server - userspace VPN server using gotatun
-// Routes client traffic to the internet with NAT
+// Legacy server prototype kept for reference while the active wirecagesrv
+// implementation lives under src/srv/. Cargo builds src/srv/main.rs.
 
 mod srv;
 mod server_args;

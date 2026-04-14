@@ -1,3 +1,6 @@
+// Legacy CLI args for the older rootful server prototype in src/server.rs.
+// The active wirecagesrv CLI is defined in src/srv/main.rs.
+
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]

@@ -1,7 +1,0 @@
-target
-.git
-.devenv
-.direnv
-devenv.lock
-testdata
-tests

@@ -3,7 +3,7 @@ use base64::Engine;
 use gotatun::noise::Tunn;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -41,8 +41,7 @@ impl WireGuardTunnel {
         let mut pub_key = [0u8; 32];
         pub_key.copy_from_slice(&public_key_bytes);
 
-        // Parse endpoint
-        let endpoint: SocketAddr = endpoint.parse().context("invalid endpoint")?;
+        let endpoint = resolve_endpoint(endpoint).await?;
 
         // Create tunnel
         let tunnel = Tunn::new(priv_key.into(), pub_key.into(), None, None, 0, None);
@@ -76,4 +75,16 @@ impl WireGuardTunnel {
     pub fn endpoint(&self) -> SocketAddr {
         self.endpoint
     }
+}
+
+async fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr> {
+    if let Ok(addr) = endpoint.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    lookup_host(endpoint)
+        .await
+        .with_context(|| format!("failed to resolve endpoint `{}`", endpoint))?
+        .next()
+        .with_context(|| format!("endpoint `{}` resolved to no addresses", endpoint))
 }

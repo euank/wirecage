@@ -20,7 +20,8 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level_for(&cli))),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level_for(&cli)))
+                .add_directive("netlink_packet_route::link::buffer_tool=error".parse().unwrap()),
         )
         .init();
 

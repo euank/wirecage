@@ -83,7 +83,8 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new("info")
                     .add_directive("gotatun::noise::timers=error".parse().unwrap())
-            }),
+            })
+            .add_directive("netlink_packet_route::link::buffer_tool=error".parse().unwrap()),
         )
         .init();
 

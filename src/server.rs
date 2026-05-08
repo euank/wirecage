@@ -458,7 +458,8 @@ async fn main() -> Result<()> {
                     tracing_subscriber::EnvFilter::new("info")
                         // Suppress noisy gotatun timer warnings
                         .add_directive("gotatun::noise::timers=error".parse().unwrap())
-                }),
+                })
+                .add_directive("netlink_packet_route::link::buffer_tool=error".parse().unwrap()),
         )
         .init();
 

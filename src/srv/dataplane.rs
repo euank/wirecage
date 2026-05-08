@@ -108,7 +108,6 @@ enum TcpFlowState {
     SynReceived,
     Established,
     FinWait,
-    Closed,
 }
 
 /// Active UDP flow state
@@ -765,18 +764,14 @@ impl Dataplane {
 
             // Spawn task to handle WAN connection
             let wan_tx_back = self.wan_tx_template.clone();
-            let wg_io = Arc::clone(&self.wg_io);
             let flow_key_clone = flow_key;
-            let peer_pubkey_clone = *peer_pubkey;
 
             tokio::spawn(async move {
                 Self::run_tcp_wan_task(
                     flow_key_clone,
-                    peer_pubkey_clone,
                     remote_addr,
                     wan_rx,
                     wan_tx_back,
-                    wg_io,
                 )
                 .await;
             });
@@ -817,11 +812,9 @@ impl Dataplane {
 
     async fn run_tcp_wan_task(
         flow_key: FlowKey,
-        peer_pubkey: [u8; 32],
         remote_addr: SocketAddrV4,
         mut from_client: mpsc::Receiver<Vec<u8>>,
         to_dataplane: mpsc::Sender<WanToDataplane>,
-        wg_io: Arc<WgIo>,
     ) {
         // Connect to remote
         let stream = match tokio::time::timeout(
@@ -969,7 +962,6 @@ impl Dataplane {
 
             // Spawn WAN task
             let wan_tx_back = self.wan_tx_template.clone();
-            let wg_io = Arc::clone(&self.wg_io);
 
             tokio::spawn(async move {
                 Self::run_udp_wan_task(flow_key, wan_socket, wan_rx, wan_tx_back).await;
@@ -1046,7 +1038,7 @@ impl Dataplane {
                 }
             }
             WanToDataplane::TcpClosed { flow_key } => {
-                if let Some(flow) = self.tcp_flows.get(&flow_key) {
+                if self.tcp_flows.contains_key(&flow_key) {
                     self.send_tcp_fin(&flow_key).await;
                 }
                 self.tcp_flows.remove(&flow_key);

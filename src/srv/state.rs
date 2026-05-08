@@ -11,15 +11,10 @@ use super::flow::{PortForwardRule, Protocol};
 /// Configuration for the server
 #[derive(Clone)]
 pub struct ServerConfig {
-    pub server_private_key: [u8; 32],
     pub server_public_key: [u8; 32],
-    pub listen_addr: String,
-    pub api_listen_addr: String,
     pub subnet: Ipv4Addr,
     pub subnet_mask: u8,
     pub auth_token: String,
-    pub tls_cert_path: Option<String>,
-    pub tls_key_path: Option<String>,
 }
 
 /// A registered peer
@@ -27,8 +22,6 @@ pub struct ServerConfig {
 pub struct PeerInfo {
     pub public_key: [u8; 32],
     pub assigned_ip: Ipv4Addr,
-    pub allowed_ips: Vec<String>,
-    pub created_at: std::time::Instant,
 }
 
 /// IP address pool for dynamic allocation
@@ -70,15 +63,6 @@ impl IpPool {
         None
     }
 
-    /// Release an IP back to the pool
-    pub fn release(&mut self, ip: Ipv4Addr) {
-        self.allocated.remove(&ip);
-    }
-
-    /// Check if an IP is allocated
-    pub fn is_allocated(&self, ip: &Ipv4Addr) -> bool {
-        self.allocated.contains(ip)
-    }
 }
 
 /// Peer registry - maps public keys to peer info
@@ -102,25 +86,8 @@ impl PeerRegistry {
         self.by_pubkey.insert(pubkey, info);
     }
 
-    pub fn remove_by_pubkey(&mut self, pubkey: &[u8; 32]) -> Option<PeerInfo> {
-        if let Some(info) = self.by_pubkey.remove(pubkey) {
-            self.by_ip.remove(&info.assigned_ip);
-            Some(info)
-        } else {
-            None
-        }
-    }
-
     pub fn get_by_pubkey(&self, pubkey: &[u8; 32]) -> Option<&PeerInfo> {
         self.by_pubkey.get(pubkey)
-    }
-
-    pub fn get_by_ip(&self, ip: &Ipv4Addr) -> Option<&PeerInfo> {
-        self.by_ip.get(ip).and_then(|pk| self.by_pubkey.get(pk))
-    }
-
-    pub fn pubkey_for_ip(&self, ip: &Ipv4Addr) -> Option<[u8; 32]> {
-        self.by_ip.get(ip).copied()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &PeerInfo> {
@@ -189,35 +156,6 @@ impl PortForwardRegistry {
         }
     }
 
-    /// Get TCP rule by port
-    pub fn get_tcp(&self, port: u16) -> Option<&PortForwardRule> {
-        self.tcp_rules.get(&port)
-    }
-
-    /// Get UDP rule by port
-    pub fn get_udp(&self, port: u16) -> Option<&PortForwardRule> {
-        self.udp_rules.get(&port)
-    }
-
-    /// Get all TCP rules (for starting listeners)
-    pub fn tcp_rules(&self) -> impl Iterator<Item = &PortForwardRule> {
-        self.tcp_rules.values()
-    }
-
-    /// Get all UDP rules
-    pub fn udp_rules(&self) -> impl Iterator<Item = &PortForwardRule> {
-        self.udp_rules.values()
-    }
-
-    /// Remove all rules for a peer
-    pub fn remove_by_peer(&mut self, pubkey: &[u8; 32]) {
-        if let Some(ports) = self.by_peer.remove(pubkey) {
-            for port in ports {
-                self.tcp_rules.remove(&port);
-                self.udp_rules.remove(&port);
-            }
-        }
-    }
 }
 
 impl Default for PortForwardRegistry {

@@ -8,7 +8,7 @@ pub struct OverlayGuard {
     _tmpdir: tempfile::TempDir,
 }
 
-pub fn setup_etc_overlay(gateway: &str) -> Result<OverlayGuard> {
+pub fn setup_etc_overlay(_gateway: &str) -> Result<OverlayGuard> {
     // Check if /etc exists and is a directory
     if !Path::new("/etc").is_dir() {
         anyhow::bail!("/etc is not a directory");

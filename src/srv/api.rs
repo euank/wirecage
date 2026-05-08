@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -28,20 +28,6 @@ pub struct RegisterRequest {
     pub client_public_key: String,
 }
 
-/// Response with WireGuard configuration
-#[derive(Debug, Serialize)]
-pub struct RegisterResponse {
-    pub client_address: String,
-    pub server_public_key: String,
-    pub server_endpoint: String,
-}
-
-/// Error response
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
-}
-
 /// Request to create a port forward
 #[derive(Debug, Deserialize)]
 pub struct PortForwardRequest {
@@ -49,14 +35,6 @@ pub struct PortForwardRequest {
     pub client_public_key: String,
     pub protocol: String, // "tcp" or "udp"
     pub public_port: u16,
-    pub target_port: u16,
-}
-
-/// Response for port forward creation
-#[derive(Debug, Serialize)]
-pub struct PortForwardResponse {
-    pub public_port: u16,
-    pub protocol: String,
     pub target_port: u16,
 }
 
@@ -158,8 +136,6 @@ async fn register_handler(
         let peer_info = PeerInfo {
             public_key: client_public_key,
             assigned_ip: allocated_ip,
-            allowed_ips: vec![format!("{}/32", allocated_ip)],
-            created_at: std::time::Instant::now(),
         };
 
         let mut peers = ctx.shared.peers.write();

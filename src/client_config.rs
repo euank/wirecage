@@ -27,7 +27,6 @@ pub struct ServerConfig {
 #[derive(Debug, Clone)]
 pub struct KeyMaterial {
     pub private_key_path: PathBuf,
-    pub private_key_b64: String,
     pub public_key_b64: String,
 }
 
@@ -144,7 +143,6 @@ pub fn ensure_client_key(server_name: &str) -> Result<KeyMaterial> {
 
     Ok(KeyMaterial {
         private_key_path,
-        private_key_b64,
         public_key_b64,
     })
 }

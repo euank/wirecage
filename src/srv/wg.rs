@@ -52,13 +52,6 @@ pub struct WgToDataplane {
     pub ip_packet: Vec<u8>,
 }
 
-/// Packet from dataplane to WireGuard (to encrypt and send)
-#[derive(Debug)]
-pub struct DataplaneToWg {
-    pub peer_pubkey: [u8; 32],
-    pub ip_packet: Vec<u8>,
-}
-
 /// WireGuard IO handler
 pub struct WgIo {
     socket: Arc<UdpSocket>,
@@ -85,36 +78,6 @@ impl WgIo {
             peers: Arc::new(RwLock::new(HashMap::new())),
             shared_state,
         })
-    }
-
-    /// Add a peer dynamically
-    pub fn add_peer(&self, peer_public_key: [u8; 32]) {
-        let peer = Arc::new(WgPeer::new(self.server_private_key, peer_public_key));
-        self.peers.write().insert(peer_public_key, peer);
-        info!(
-            "Added WireGuard peer: {}",
-            base64::engine::general_purpose::STANDARD.encode(peer_public_key)
-        );
-    }
-
-    /// Remove a peer
-    pub fn remove_peer(&self, peer_public_key: &[u8; 32]) {
-        self.peers.write().remove(peer_public_key);
-    }
-
-    /// Get socket for sending
-    pub fn socket(&self) -> Arc<UdpSocket> {
-        Arc::clone(&self.socket)
-    }
-
-    /// Get peers map
-    pub fn peers(&self) -> Arc<RwLock<HashMap<[u8; 32], Arc<WgPeer>>>> {
-        Arc::clone(&self.peers)
-    }
-
-    /// Get shared state
-    pub fn shared_state(&self) -> Arc<SharedState> {
-        Arc::clone(&self.shared_state)
     }
 
     /// Run the receive loop - decrypts incoming WG packets and sends to dataplane

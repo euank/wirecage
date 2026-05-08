@@ -118,15 +118,10 @@ async fn main() -> Result<()> {
 
     // Create shared state
     let config = ServerConfig {
-        server_private_key,
         server_public_key,
-        listen_addr: args.wg_listen.clone(),
-        api_listen_addr: args.api_listen.clone(),
         subnet: server_ip,
         subnet_mask: args.subnet_mask,
         auth_token: args.auth_token.clone(),
-        tls_cert_path: args.tls_cert.clone(),
-        tls_key_path: args.tls_key.clone(),
     };
 
     let shared_state = SharedState::new(config);

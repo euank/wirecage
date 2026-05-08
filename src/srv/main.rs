@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -28,10 +28,19 @@ use wg::WgIo;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "wirecagesrv")]
 #[command(about = "WireGuard VPN Server with userspace NAT and HTTPS API")]
+#[command(group(
+    ArgGroup::new("private_key_source")
+        .required(true)
+        .args(["private_key", "private_key_file"])
+))]
 struct Args {
+    /// Server private key (base64-encoded 32-byte key)
+    #[arg(long, env = "WG_PRIVATE_KEY_B64")]
+    private_key: Option<String>,
+
     /// Path to server private key file (base64-encoded 32-byte key)
     #[arg(long, env = "WG_PRIVATE_KEY_FILE")]
-    private_key_file: String,
+    private_key_file: Option<String>,
 
     /// WireGuard listen address and port
     #[arg(long, default_value = "0.0.0.0:51820")]
@@ -80,10 +89,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Load server private key
-    let private_key_b64 = tokio::fs::read_to_string(&args.private_key_file)
-        .await
-        .context("failed to read server private key file")?;
+    let private_key_b64 = load_private_key_b64(&args).await?;
 
     let private_key_bytes = base64::engine::general_purpose::STANDARD
         .decode(private_key_b64.trim())
@@ -191,4 +197,19 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn load_private_key_b64(args: &Args) -> Result<String> {
+    if let Some(private_key) = &args.private_key {
+        return Ok(private_key.clone());
+    }
+
+    let private_key_file = args
+        .private_key_file
+        .as_ref()
+        .context("either --private-key or --private-key-file is required")?;
+
+    tokio::fs::read_to_string(private_key_file)
+        .await
+        .context("failed to read server private key file")
 }

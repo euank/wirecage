@@ -100,6 +100,9 @@ wg genkey > server.key
   --wg-endpoint "vpn.example.com:51820"
 ```
 
+For container deployments, the server private key can also be supplied directly
+with `WG_PRIVATE_KEY_B64` instead of mounting a key file.
+
 ### Client Registration
 
 Clients register by sending their own WireGuard public key to the API. The server assigns an address and returns the server-side connection metadata; it does not generate or return a client private key.
@@ -159,7 +162,8 @@ curl -X DELETE http://localhost:8443/v1/portforward \
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--private-key-file` | (required) | Path to server's WireGuard private key |
+| `--private-key` / `WG_PRIVATE_KEY_B64` | (required unless file is set) | Server's base64 WireGuard private key |
+| `--private-key-file` / `WG_PRIVATE_KEY_FILE` | (required unless key is set) | Path to server's WireGuard private key |
 | `--auth-token` | (required) | Token for API authentication |
 | `--wg-endpoint` | (required) | Public endpoint clients will connect to |
 | `--wg-listen` | `0.0.0.0:51820` | WireGuard UDP listen address |

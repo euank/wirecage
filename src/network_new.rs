@@ -14,6 +14,8 @@ type TunToWgPacket = Vec<u8>;
 /// Packet to send from WireGuard (in host namespace) to TUN (in child namespace)
 type WgToTunPacket = Vec<u8>;
 
+const MAX_PACKET: usize = 65536;
+
 /// Run WireGuard in the HOST network namespace
 /// This runs before we create the child network namespace
 pub async fn run_wireguard_host(
@@ -85,7 +87,7 @@ pub async fn run_wireguard_host(
             "WG->TUN forwarder started (host namespace), listening on {}",
             local_addr
         );
-        let mut recv_buf = vec![0u8; 2048];
+        let mut recv_buf = vec![0u8; MAX_PACKET];
         let mut counter = 0u32;
 
         loop {
@@ -99,6 +101,12 @@ pub async fn run_wireguard_host(
             {
                 Ok(Ok((n, addr))) => {
                     debug!("WG->TUN: received {} bytes from {}", n, addr);
+                    if n == recv_buf.len() {
+                        error!(
+                            "WG->TUN: received packet filled the {} byte buffer; packet may be truncated",
+                            recv_buf.len()
+                        );
+                    }
 
                     let mut tunnel = wg_tunnel_rx.lock().await;
                     let packet = Packet::from_bytes(bytes::BytesMut::from(&recv_buf[..n]));
@@ -233,7 +241,7 @@ pub async fn run_tun_child(
     // Task: Read from TUN, send to WireGuard (using raw FD)
     tokio::task::spawn_blocking(move || {
         debug!("TUN reader started (blocking)");
-        let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; MAX_PACKET];
         loop {
             let n = unsafe {
                 libc::read(

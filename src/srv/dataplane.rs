@@ -31,8 +31,6 @@ use super::wg::{WgIo, WgToDataplane};
 const SMOLTCP_MTU: usize = 1420;
 const SMOLTCP_SOCKET_BUFFER: usize = 256 * 1024;
 const WAN_READ_BUFFER: usize = 16 * 1024;
-const TCP_ADVERTISED_WINDOW: u16 = u16::MAX;
-
 /// Message from WAN socket back to dataplane
 #[derive(Debug)]
 enum WanToDataplane {
@@ -84,21 +82,6 @@ struct InboundFlowKey {
 
 /// Inbound TCP flow (internet -> client)
 struct InboundTcpFlow {
-    rule: PortForwardRule,
-    // Simulated client-side port (we pick one)
-    simulated_client_port: u16,
-    // Sequence numbers for the simulated connection to the client
-    our_seq: u32,
-    client_seq: u32,
-    // Channel to send data to the WAN task (to forward to internet client)
-    wan_tx: mpsc::Sender<Vec<u8>>,
-    // Data received from the internet client before the VPN-side handshake completes.
-    pending_data: Vec<Vec<u8>>,
-    last_activity: Instant,
-    state: TcpFlowState,
-}
-
-struct SmolTcpFlow {
     socket: SocketHandle,
     wan_tx: mpsc::Sender<Vec<u8>>,
     pending_to_client: VecDeque<Vec<u8>>,
@@ -106,12 +89,7 @@ struct SmolTcpFlow {
     wan_closed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TcpFlowState {
-    SynReceived,
-    Established,
-    FinWait,
-}
+type SmolTcpFlow = InboundTcpFlow;
 
 /// Active UDP flow state
 struct UdpFlow {
@@ -227,7 +205,6 @@ pub struct Dataplane {
     // Track active listeners so we can stop them
     tcp_listeners: HashMap<u16, tokio::task::JoinHandle<()>>,
     udp_listeners: HashMap<u16, tokio::task::JoinHandle<()>>,
-    next_simulated_port: u16,
 }
 
 impl Dataplane {
@@ -270,7 +247,6 @@ impl Dataplane {
             inbound_tx,
             tcp_listeners: HashMap::new(),
             udp_listeners: HashMap::new(),
-            next_simulated_port: 40000,
         }
     }
 
@@ -504,31 +480,35 @@ impl Dataplane {
             remote_port,
             public_port: rule.public_port,
         };
-
-        // Allocate a simulated client port
-        let simulated_port = self.next_simulated_port;
-        self.next_simulated_port = self.next_simulated_port.wrapping_add(1);
-        if self.next_simulated_port < 40000 {
-            self.next_simulated_port = 40000;
-        }
+        self.peer_by_ip.insert(rule.peer_ip, rule.peer_pubkey);
 
         let (wan_tx, mut wan_rx) = mpsc::channel::<Vec<u8>>(100);
 
+        let rx_buffer = tcp::SocketBuffer::new(vec![0; SMOLTCP_SOCKET_BUFFER]);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0; SMOLTCP_SOCKET_BUFFER]);
+        let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+        let remote_endpoint = SocketAddrV4::new(rule.peer_ip, rule.target_port);
+        let local_endpoint = SocketAddrV4::new(remote_ip, remote_port);
+
+        if let Err(e) = socket.connect(self.smol_iface.context(), remote_endpoint, local_endpoint) {
+            warn!(
+                "Failed to open smoltcp inbound TCP flow {}:{} -> {}:{}: {:?}",
+                remote_ip, remote_port, rule.peer_ip, rule.target_port, e
+            );
+            return;
+        }
+
+        let socket = self.smol_sockets.add(socket);
         let flow = InboundTcpFlow {
-            rule: rule.clone(),
-            simulated_client_port: simulated_port,
-            our_seq: rand::random(),
-            client_seq: 0,
+            socket,
             wan_tx,
-            pending_data: Vec::new(),
+            pending_to_client: VecDeque::new(),
             last_activity: Instant::now(),
-            state: TcpFlowState::SynReceived,
+            wan_closed: false,
         };
 
         self.inbound_tcp_flows.insert(flow_key, flow);
-
-        // Send SYN to the VPN client
-        self.send_inbound_tcp_syn(&flow_key).await;
+        self.poll_smol_tcp().await;
 
         // Split the TCP stream for bidirectional relay
         let (mut read_half, mut write_half) = stream.into_split();
@@ -592,87 +572,6 @@ impl Dataplane {
             "Created inbound TCP flow: {}:{} -> {}:{}",
             remote_ip, remote_port, rule.peer_ip, rule.target_port
         );
-    }
-
-    /// Send TCP SYN to VPN client for inbound connection
-    async fn send_inbound_tcp_syn(&self, flow_key: &InboundFlowKey) {
-        let Some(flow) = self.inbound_tcp_flows.get(flow_key) else {
-            return;
-        };
-
-        // Build SYN packet: from (remote_ip, simulated_port) to (peer_ip, target_port)
-        // The client sees this as a new incoming connection
-        let packet = build_tcp_packet(
-            flow_key.remote_ip,         // src (appears to come from internet)
-            flow.rule.peer_ip,          // dst (VPN client)
-            flow.simulated_client_port, // src port
-            flow.rule.target_port,      // dst port (client's listening port)
-            flow.our_seq,
-            0,
-            TcpFlags::SYN,
-            &[],
-        );
-
-        self.send_to_client(&flow.rule.peer_pubkey, &packet).await;
-    }
-
-    /// Send TCP data to VPN client for inbound connection
-    async fn send_inbound_tcp_data(&mut self, flow_key: &InboundFlowKey, data: &[u8]) {
-        let Some(flow) = self.inbound_tcp_flows.get(flow_key) else {
-            return;
-        };
-
-        // Only send data if connection is established
-        if flow.state != TcpFlowState::Established {
-            debug!("Inbound flow not established, queuing data");
-            if let Some(flow) = self.inbound_tcp_flows.get_mut(flow_key) {
-                flow.pending_data.push(data.to_vec());
-                flow.last_activity = Instant::now();
-            }
-            return;
-        }
-
-        let packet = build_tcp_packet(
-            flow_key.remote_ip,         // src (internet client)
-            flow.rule.peer_ip,          // dst (VPN client)
-            flow.simulated_client_port, // src port
-            flow.rule.target_port,      // dst port
-            flow.our_seq.wrapping_add(1),
-            flow.client_seq.wrapping_add(1),
-            TcpFlags::ACK | TcpFlags::PSH,
-            data,
-        );
-
-        self.send_to_client(&flow.rule.peer_pubkey, &packet).await;
-
-        // Update sequence number
-        if let Some(flow) = self.inbound_tcp_flows.get_mut(flow_key) {
-            flow.our_seq = flow.our_seq.wrapping_add(data.len() as u32);
-            flow.last_activity = Instant::now();
-        }
-
-        debug!("Sent {} bytes to VPN client via inbound flow", data.len());
-    }
-
-    /// Send TCP FIN to VPN client for inbound connection
-    async fn send_inbound_tcp_fin(&self, flow_key: &InboundFlowKey) {
-        let Some(flow) = self.inbound_tcp_flows.get(flow_key) else {
-            return;
-        };
-
-        let packet = build_tcp_packet(
-            flow_key.remote_ip,
-            flow.rule.peer_ip,
-            flow.simulated_client_port,
-            flow.rule.target_port,
-            flow.our_seq.wrapping_add(1),
-            flow.client_seq.wrapping_add(1),
-            TcpFlags::FIN | TcpFlags::ACK,
-            &[],
-        );
-
-        self.send_to_client(&flow.rule.peer_pubkey, &packet).await;
-        debug!("Sent FIN to VPN client for inbound flow");
     }
 
     /// Handle inbound UDP packet
@@ -752,8 +651,6 @@ impl Dataplane {
 
         let src_port = tcp.src_port();
         let dst_port = tcp.dst_port();
-        let seq = tcp.seq_number().0 as u32;
-
         trace!(
             "TCP {}:{} -> {}:{} flags: SYN={} ACK={} FIN={} RST={}",
             src_ip,
@@ -766,102 +663,22 @@ impl Dataplane {
             tcp.rst()
         );
 
-        // First, check if this is a response to an inbound port-forward flow
-        // For inbound flows, the client (src_ip) is responding to our SYN
-        // Look for a flow where:
-        //   - peer_ip matches src_ip (client is sending)
-        //   - target_port matches src_port (client's listening port)
-        //   - remote_ip matches dst_ip (destination is the internet client)
-        for (inbound_key, inbound_flow) in self.inbound_tcp_flows.iter_mut() {
-            if inbound_flow.rule.peer_ip == src_ip
-                && inbound_flow.rule.target_port == src_port
-                && inbound_key.remote_ip == dst_ip
-                && inbound_flow.simulated_client_port == dst_port
-            {
-                // This is a response to an inbound flow
-                inbound_flow.last_activity = Instant::now();
-
-                if tcp.syn() && tcp.ack() {
-                    // SYN-ACK from client - connection accepted
-                    debug!("Inbound flow: received SYN-ACK from client");
-                    inbound_flow.client_seq = seq;
-                    inbound_flow.state = TcpFlowState::Established;
-                    let flow_key_copy = *inbound_key;
-                    let pending = std::mem::take(&mut inbound_flow.pending_data);
-
-                    // Send ACK to complete handshake
-                    let ack_packet = build_tcp_packet(
-                        dst_ip, // from internet client
-                        src_ip, // to VPN client
-                        dst_port,
-                        src_port,
-                        inbound_flow.our_seq.wrapping_add(1),
-                        seq.wrapping_add(1),
-                        TcpFlags::ACK,
-                        &[],
-                    );
-                    self.send_to_client(peer_pubkey, &ack_packet).await;
-
-                    for data in pending {
-                        self.send_inbound_tcp_data(&flow_key_copy, &data).await;
-                    }
-                    return;
-                }
-
-                if tcp.ack() && !tcp.syn() && !tcp.fin() {
-                    // Data or ACK from client
-                    let payload = tcp.payload();
-                    if !payload.is_empty() {
-                        debug!("Inbound flow: {} bytes from client", payload.len());
-                        inbound_flow.client_seq = seq.wrapping_add(payload.len() as u32);
-                        // Forward data to the internet client via wan_tx
-                        if inbound_flow.wan_tx.try_send(payload.to_vec()).is_err() {
-                            warn!("Inbound flow: WAN channel full");
-                        }
-
-                        let ack_packet = build_tcp_packet(
-                            dst_ip,
-                            src_ip,
-                            dst_port,
-                            src_port,
-                            inbound_flow.our_seq.wrapping_add(1),
-                            inbound_flow.client_seq,
-                            TcpFlags::ACK,
-                            &[],
-                        );
-                        self.send_to_client(peer_pubkey, &ack_packet).await;
-                    } else {
-                        inbound_flow.client_seq = seq;
-                    }
-                    return;
-                }
-
-                if tcp.fin() {
-                    debug!("Inbound flow: FIN from client");
-                    inbound_flow.state = TcpFlowState::FinWait;
-                    // Forward FIN to internet client (close the connection)
-                    return;
-                }
-
-                if tcp.rst() {
-                    debug!("Inbound flow: RST from client");
-                    // Connection rejected/reset
-                    return;
-                }
-
-                return;
-            }
-        }
-
         self.handle_outbound_tcp_packet(
             *peer_pubkey,
             src_ip,
             src_port,
             dst_ip,
             dst_port,
+            !self.is_inbound_smol_packet(dst_ip, dst_port),
             ip_packet,
         )
         .await;
+    }
+
+    fn is_inbound_smol_packet(&self, dst_ip: Ipv4Addr, dst_port: u16) -> bool {
+        self.inbound_tcp_flows
+            .keys()
+            .any(|key| key.remote_ip == dst_ip && key.remote_port == dst_port)
     }
 
     async fn handle_outbound_tcp_packet(
@@ -871,6 +688,7 @@ impl Dataplane {
         src_port: u16,
         dst_ip: Ipv4Addr,
         dst_port: u16,
+        ensure_listener: bool,
         ip_packet: &[u8],
     ) {
         self.peer_by_ip.insert(src_ip, peer_pubkey);
@@ -888,7 +706,9 @@ impl Dataplane {
             return;
         }
 
-        self.ensure_smol_listener(dst_port);
+        if ensure_listener {
+            self.ensure_smol_listener(dst_port);
+        }
         self.smol_device.push_rx(ip_packet.to_vec());
         self.poll_smol_tcp().await;
     }
@@ -930,11 +750,14 @@ impl Dataplane {
             .poll(now, &mut self.smol_device, &mut self.smol_sockets);
         self.promote_smol_tcp_accepts().await;
         self.drain_smol_tcp_to_wan();
+        self.drain_inbound_smol_tcp_to_wan();
         self.flush_pending_wan_to_smol();
+        self.flush_pending_inbound_wan_to_smol();
         self.smol_iface
             .poll(now, &mut self.smol_device, &mut self.smol_sockets);
         self.drain_smol_tx().await;
         self.cleanup_closed_smol_tcp();
+        self.cleanup_closed_inbound_smol_tcp();
     }
 
     fn smol_now(&self) -> SmolInstant {
@@ -1068,6 +891,37 @@ impl Dataplane {
         }
     }
 
+    fn drain_inbound_smol_tcp_to_wan(&mut self) {
+        let mut buf = vec![0u8; WAN_READ_BUFFER];
+        let flow_keys: Vec<InboundFlowKey> = self.inbound_tcp_flows.keys().copied().collect();
+
+        for flow_key in flow_keys {
+            let Some(flow) = self.inbound_tcp_flows.get_mut(&flow_key) else {
+                continue;
+            };
+            let socket = self.smol_sockets.get_mut::<tcp::Socket>(flow.socket);
+
+            while socket.can_recv() {
+                let Ok(permit) = flow.wan_tx.try_reserve() else {
+                    trace!("Inbound WAN TCP channel full for {:?}", flow_key);
+                    break;
+                };
+
+                match socket.recv_slice(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        flow.last_activity = Instant::now();
+                        permit.send(buf[..n].to_vec());
+                    }
+                    Err(e) => {
+                        debug!("inbound smoltcp TCP recv error for {:?}: {:?}", flow_key, e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     fn flush_pending_wan_to_smol(&mut self) {
         let flow_keys: Vec<FlowKey> = self.tcp_flows.keys().copied().collect();
 
@@ -1097,6 +951,47 @@ impl Dataplane {
                     }
                     Err(e) => {
                         debug!("smoltcp TCP send error for {:?}: {:?}", flow_key, e);
+                        flow.pending_to_client.push_front(data);
+                        break;
+                    }
+                }
+            }
+
+            if flow.wan_closed && flow.pending_to_client.is_empty() {
+                socket.close();
+            }
+        }
+    }
+
+    fn flush_pending_inbound_wan_to_smol(&mut self) {
+        let flow_keys: Vec<InboundFlowKey> = self.inbound_tcp_flows.keys().copied().collect();
+
+        for flow_key in flow_keys {
+            let Some(flow) = self.inbound_tcp_flows.get_mut(&flow_key) else {
+                continue;
+            };
+            let socket = self.smol_sockets.get_mut::<tcp::Socket>(flow.socket);
+
+            while socket.can_send() {
+                let Some(mut data) = flow.pending_to_client.pop_front() else {
+                    break;
+                };
+                match socket.send_slice(&data) {
+                    Ok(0) => {
+                        flow.pending_to_client.push_front(data);
+                        break;
+                    }
+                    Ok(n) if n == data.len() => {
+                        flow.last_activity = Instant::now();
+                    }
+                    Ok(n) => {
+                        data.drain(..n);
+                        flow.pending_to_client.push_front(data);
+                        flow.last_activity = Instant::now();
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("inbound smoltcp TCP send error for {:?}: {:?}", flow_key, e);
                         flow.pending_to_client.push_front(data);
                         break;
                     }
@@ -1142,6 +1037,27 @@ impl Dataplane {
 
         for flow_key in closed {
             if let Some(flow) = self.tcp_flows.remove(&flow_key) {
+                self.smol_sockets.remove(flow.socket);
+            }
+        }
+    }
+
+    fn cleanup_closed_inbound_smol_tcp(&mut self) {
+        let closed: Vec<InboundFlowKey> = self
+            .inbound_tcp_flows
+            .iter()
+            .filter_map(|(flow_key, flow)| {
+                let socket = self.smol_sockets.get::<tcp::Socket>(flow.socket);
+                if !socket.is_open() {
+                    Some(*flow_key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for flow_key in closed {
+            if let Some(flow) = self.inbound_tcp_flows.remove(&flow_key) {
                 self.smol_sockets.remove(flow.socket);
             }
         }
@@ -1373,13 +1289,17 @@ impl Dataplane {
                 }
             }
             WanToDataplane::InboundTcpData { flow_key, data } => {
-                // Data from internet client to forward to VPN client
-                self.send_inbound_tcp_data(&flow_key, &data).await;
+                if let Some(flow) = self.inbound_tcp_flows.get_mut(&flow_key) {
+                    flow.last_activity = Instant::now();
+                    flow.pending_to_client.push_back(data);
+                    self.poll_smol_tcp().await;
+                }
             }
             WanToDataplane::InboundTcpClosed { flow_key } => {
-                // Internet client closed connection - send FIN to VPN client
-                self.send_inbound_tcp_fin(&flow_key).await;
-                self.inbound_tcp_flows.remove(&flow_key);
+                if let Some(flow) = self.inbound_tcp_flows.get_mut(&flow_key) {
+                    flow.wan_closed = true;
+                    self.poll_smol_tcp().await;
+                }
             }
         }
     }
@@ -1428,75 +1348,26 @@ impl Dataplane {
             }
         }
 
+        let expired_inbound_tcp: Vec<InboundFlowKey> = self
+            .inbound_tcp_flows
+            .iter()
+            .filter_map(|(flow_key, flow)| {
+                (now.duration_since(flow.last_activity) >= tcp_timeout).then_some(*flow_key)
+            })
+            .collect();
+
+        for flow_key in expired_inbound_tcp {
+            if let Some(flow) = self.inbound_tcp_flows.remove(&flow_key) {
+                self.smol_sockets
+                    .get_mut::<tcp::Socket>(flow.socket)
+                    .abort();
+                self.smol_sockets.remove(flow.socket);
+            }
+        }
+
         self.udp_flows
             .retain(|_, flow| now.duration_since(flow.last_activity) < udp_timeout);
     }
-}
-
-// TCP flags
-struct TcpFlags;
-impl TcpFlags {
-    const SYN: u8 = 0x02;
-    const ACK: u8 = 0x10;
-    const FIN: u8 = 0x01;
-    const PSH: u8 = 0x08;
-}
-
-/// Build a TCP packet with IP header
-fn build_tcp_packet(
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    payload: &[u8],
-) -> Vec<u8> {
-    let tcp_len = 20 + payload.len(); // TCP header + payload
-    let total_len = 20 + tcp_len; // IP header + TCP
-
-    let mut packet = vec![0u8; total_len];
-
-    // IP header
-    packet[0] = 0x45; // Version 4, IHL 5
-    packet[1] = 0; // DSCP/ECN
-    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    packet[4..6].copy_from_slice(&rand::random::<u16>().to_be_bytes()); // ID
-    packet[6] = 0x40; // Don't fragment
-    packet[7] = 0;
-    packet[8] = 64; // TTL
-    packet[9] = 6; // Protocol: TCP
-    // Checksum at 10-11, calculated below
-    packet[12..16].copy_from_slice(&src_ip.octets());
-    packet[16..20].copy_from_slice(&dst_ip.octets());
-
-    // IP checksum
-    let ip_checksum = ip_checksum(&packet[0..20]);
-    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
-    // TCP header
-    let tcp = &mut packet[20..];
-    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
-    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
-    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
-    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
-    tcp[12] = 0x50; // Data offset: 5 (20 bytes)
-    tcp[13] = flags;
-    tcp[14..16].copy_from_slice(&TCP_ADVERTISED_WINDOW.to_be_bytes());
-    // Checksum at 16-17
-    tcp[18..20].copy_from_slice(&0u16.to_be_bytes()); // Urgent pointer
-
-    // Payload
-    if !payload.is_empty() {
-        tcp[20..20 + payload.len()].copy_from_slice(payload);
-    }
-
-    // TCP checksum (with pseudo-header)
-    let tcp_checksum = tcp_checksum(src_ip, dst_ip, &packet[20..]);
-    packet[20 + 16..20 + 18].copy_from_slice(&tcp_checksum.to_be_bytes());
-
-    packet
 }
 
 /// Build a UDP packet with IP header
@@ -1554,38 +1425,6 @@ fn ip_checksum(header: &[u8]) -> u16 {
         };
         sum = sum.wrapping_add(word);
     }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-fn tcp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_segment: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-
-    // Pseudo-header
-    let src = src_ip.octets();
-    let dst = dst_ip.octets();
-    sum = sum.wrapping_add(((src[0] as u32) << 8) | (src[1] as u32));
-    sum = sum.wrapping_add(((src[2] as u32) << 8) | (src[3] as u32));
-    sum = sum.wrapping_add(((dst[0] as u32) << 8) | (dst[1] as u32));
-    sum = sum.wrapping_add(((dst[2] as u32) << 8) | (dst[3] as u32));
-    sum = sum.wrapping_add(6); // Protocol: TCP
-    sum = sum.wrapping_add(tcp_segment.len() as u32);
-
-    // TCP segment
-    for i in (0..tcp_segment.len()).step_by(2) {
-        if i == 16 {
-            continue; // Skip checksum field
-        }
-        let word = if i + 1 < tcp_segment.len() {
-            ((tcp_segment[i] as u32) << 8) | (tcp_segment[i + 1] as u32)
-        } else {
-            (tcp_segment[i] as u32) << 8
-        };
-        sum = sum.wrapping_add(word);
-    }
-
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }

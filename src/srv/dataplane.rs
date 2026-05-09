@@ -28,7 +28,8 @@ use super::api::PortForwardEvent;
 use super::flow::{FlowConfig, FlowKey, PortForwardRule, Protocol};
 use super::wg::{WgIo, WgToDataplane};
 
-const SMOLTCP_MTU: usize = 1420;
+const DEFAULT_SMOLTCP_MTU: usize = 1420;
+const MIN_SMOLTCP_MTU: usize = 576;
 const SMOLTCP_SOCKET_BUFFER: usize = 256 * 1024;
 const WAN_READ_BUFFER: usize = 16 * 1024;
 /// Message from WAN socket back to dataplane
@@ -105,13 +106,15 @@ struct UdpFlow {
 struct SmolDevice {
     rx: VecDeque<Vec<u8>>,
     tx: VecDeque<Vec<u8>>,
+    mtu: usize,
 }
 
 impl SmolDevice {
-    fn new() -> Self {
+    fn new(mtu: usize) -> Self {
         Self {
             rx: VecDeque::new(),
             tx: VecDeque::new(),
+            mtu,
         }
     }
 
@@ -179,9 +182,31 @@ impl Device for SmolDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = SMOLTCP_MTU;
+        caps.max_transmission_unit = self.mtu;
         caps.max_burst_size = Some(64);
         caps
+    }
+}
+
+fn smoltcp_mtu_from_env() -> usize {
+    match std::env::var("WIRECAGE_SERVER_MTU") {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(mtu) if (MIN_SMOLTCP_MTU..=DEFAULT_SMOLTCP_MTU).contains(&mtu) => mtu,
+            Ok(mtu) => {
+                warn!(
+                    mtu,
+                    min = MIN_SMOLTCP_MTU,
+                    max = DEFAULT_SMOLTCP_MTU,
+                    "Ignoring WIRECAGE_SERVER_MTU outside supported range"
+                );
+                DEFAULT_SMOLTCP_MTU
+            }
+            Err(err) => {
+                warn!(value = raw, %err, "Ignoring invalid WIRECAGE_SERVER_MTU");
+                DEFAULT_SMOLTCP_MTU
+            }
+        },
+        Err(_) => DEFAULT_SMOLTCP_MTU,
     }
 }
 
@@ -211,7 +236,9 @@ impl Dataplane {
     pub fn new(wg_io: Arc<WgIo>, server_ip: Ipv4Addr) -> Self {
         let (wan_tx, wan_rx) = mpsc::channel(10000);
         let (inbound_tx, inbound_rx) = mpsc::channel(1000);
-        let mut smol_device = SmolDevice::new();
+        let smoltcp_mtu = smoltcp_mtu_from_env();
+        info!(mtu = smoltcp_mtu, "Configuring smoltcp interface MTU");
+        let mut smol_device = SmolDevice::new(smoltcp_mtu);
         let mut smol_config = SmolConfig::new(HardwareAddress::Ip);
         smol_config.random_seed = rand::random();
         let smol_start = Instant::now();
